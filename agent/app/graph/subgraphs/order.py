@@ -7,7 +7,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
 from app.graph.state import SharedSlots, get_chat_llm
-from app.graph.thought_stream import emit_thought
+from app.graph.thought_stream import astream_llm_message, emit_thought, emit_tool_card, emit_widget
 from app.tools.ticket_tools import (
     ORDER_READ_TOOLS,
     ORDER_WRITE_TOOLS,
@@ -24,6 +24,7 @@ class OrderSubState(TypedDict, total=False):
     sub_messages: Annotated[List[BaseMessage], add_messages]
     query: str
     history_summary: str
+    mode: str
     slots: SharedSlots
     user_id: int
     username: str
@@ -37,6 +38,10 @@ class OrderSubState(TypedDict, total=False):
 
 def _get_order_llm():
     return get_chat_llm(temperature=0.1).bind_tools(_ORDER_ALL_TOOLS)
+
+
+def _get_order_read_llm():
+    return get_chat_llm(temperature=0.1).bind_tools(ORDER_READ_TOOLS)
 
 
 def _reply_all(
@@ -69,7 +74,15 @@ async def order_agent_node(state: OrderSubState) -> Dict[str, Any]:
     - 取消未支付订单调 `propose_cancel_order`
     """
     slots = dict(state.get("slots") or {})
+    mode = (state.get("mode") or "agent").strip().lower()
+    is_chat_mode = mode == "chat"
     step_count = int(state.get("step_count") or 0)
+
+    chat_mode_note = (
+        "\n5. 【当前为 Chat 只读咨询模式】：严禁调用 `propose_cancel_order`，仅查订单与测算退票费；若用户要求取消订单，请友好提示其切换左下角【Agent 模式】操作。"
+        if is_chat_mode
+        else ""
+    )
 
     sys_text = (
         "你是 PulseTicket 的【订单与售后专员 (Order Agent)】。\n"
@@ -80,6 +93,7 @@ async def order_agent_node(state: OrderSubState) -> Dict[str, Any]:
         "2. 若用户询问某笔订单退票扣多少手续费、能退多少钱，必须调用 `check_order_refund_detail` 获取代码计算的精确金额，并标注 `[POL-REFUND-001]`，严禁自己心算；\n"
         "3. 若用户明确要求取消某笔未支付（UNPAID）订单，拿到真实订单号后调用 `propose_cancel_order`；\n"
         "4. 若订单已支付（PAID），如实附上 `check_order_refund_detail` 算出的阶梯退票明细，并告知线上取消按钮仅支持未支付锁座单，已出票订单请联系人工客服办理退票。"
+        + chat_mode_note
     )
 
     msgs = list(state.get("sub_messages") or [])
@@ -101,9 +115,10 @@ async def order_agent_node(state: OrderSubState) -> Dict[str, Any]:
     )
 
     if step_count >= _MAX_ORDER_STEPS:
-        resp = await get_chat_llm(temperature=0.1).ainvoke(msgs)
+        resp = await astream_llm_message(get_chat_llm(temperature=0.1), msgs, allow_stream=True)
     else:
-        resp = await _get_order_llm().ainvoke(msgs)
+        llm = _get_order_read_llm() if is_chat_mode else _get_order_llm()
+        resp = await astream_llm_message(llm, msgs, allow_stream=True)
 
     tcs = getattr(resp, "tool_calls", None) or []
     emit_thought(
@@ -131,6 +146,7 @@ async def order_read_tools_node(state: OrderSubState) -> Dict[str, Any]:
     steps = list(state.get("tool_steps") or [])
     citations = list(state.get("citations") or [])
     slots = dict(state.get("slots") or {})
+    mode = (state.get("mode") or "agent").strip().lower()
 
     token = current_user_ctx.set({
         "user_id": state["user_id"],
@@ -146,20 +162,84 @@ async def order_read_tools_node(state: OrderSubState) -> Dict[str, Any]:
             steps.append({"agent": "order_agent", "tool": t_name, "args": t_args})
 
             if t_name in _ORDER_READ_MAP:
+                card_id = f"tool-{t_name}-{t_id}"
+                card_title = "查询我的实时订单列表" if t_name == "list_my_orders" else "确定性阶梯退票费率核算"
+                emit_tool_card(
+                    card_id=card_id,
+                    tool_name=t_name,
+                    title=card_title,
+                    status="running",
+                    summary="正在调用 Java order-service 与费率引擎…",
+                    input_data=t_args,
+                )
                 obs = await _ORDER_READ_MAP[t_name].ainvoke(t_args)
                 obs_str = str(obs)
                 out_msgs.append(ToolMessage(content=obs_str, name=t_name, tool_call_id=t_id))
 
                 if t_name == "check_order_refund_detail" and "POL-REFUND-001" not in citations:
                     citations.append("POL-REFUND-001")
+                try:
+                    parsed = json.loads(obs_str)
+                except Exception:
+                    parsed = None
+
                 if t_name == "list_my_orders":
-                    try:
-                        parsed = json.loads(obs_str)
-                        orders = parsed.get("orders") or []
-                        if orders and not slots.get("order_no"):
-                            slots["order_no"] = orders[0].get("orderNo")
-                    except Exception:
-                        pass
+                    orders = (parsed or {}).get("orders") or []
+                    if orders and not slots.get("order_no"):
+                        slots["order_no"] = orders[0].get("orderNo")
+                    ok_flag = (parsed or {}).get("ok") is not False
+                    emit_tool_card(
+                        card_id=card_id,
+                        tool_name=t_name,
+                        title=card_title,
+                        status="done" if ok_flag else "error",
+                        summary=f"已拉取 {len(orders)} 笔历史订单" if ok_flag else (parsed or {}).get("error", "查询失败"),
+                        input_data=t_args,
+                        output_data=parsed if parsed is not None else obs_str,
+                    )
+                    unpaid = [o for o in orders if str(o.get("status", "")).upper() == "UNPAID"]
+                    if mode != "chat" and unpaid:
+                        order_options = []
+                        for o in unpaid[:3]:
+                            ono = str(o.get("orderNo") or "")
+                            seat_txt = o.get("seatLabelsJson") or ""
+                            if isinstance(seat_txt, str) and seat_txt.startswith("["):
+                                try:
+                                    seat_txt = "、".join(json.loads(seat_txt))
+                                except Exception:
+                                    pass
+                            order_options.append({
+                                "id": f"order-{ono}",
+                                "label": f"{ono} · {o.get('showTitle', '')}",
+                                "badge": "待支付 UNPAID",
+                                "meta": f"{seat_txt} · 应付 ¥{o.get('totalAmount')}".strip(" ·"),
+                                "price": o.get("totalAmount"),
+                                "prompt": f"申请取消未支付订单 {ono}",
+                            })
+                        emit_widget(
+                            widget_id=f"widget-orders-{t_id}",
+                            widget_type="ORDER_PICKER",
+                            title="检测到待支付锁座订单 · 支持一键取消释放座位",
+                            subtitle="点击需要取消的订单将先核验状态并弹出确认卡片",
+                            options=order_options,
+                        )
+                else:
+                    refund_ok = isinstance(parsed, dict) and parsed.get("ok") is not False
+                    summary_txt = "阶梯退票费率计算完成"
+                    if isinstance(parsed, dict):
+                        if parsed.get("refundAmount") is not None:
+                            summary_txt = f"费率 {parsed.get('feeRate')} · 预计可退 ¥{parsed.get('refundAmount')}"
+                        elif parsed.get("error"):
+                            summary_txt = str(parsed.get("error"))
+                    emit_tool_card(
+                        card_id=card_id,
+                        tool_name=t_name,
+                        title=card_title,
+                        status="done" if refund_ok else "error",
+                        summary=summary_txt,
+                        input_data=t_args,
+                        output_data=parsed if parsed is not None else obs_str,
+                    )
             else:
                 out_msgs.append(
                     ToolMessage(
@@ -207,6 +287,16 @@ async def verify_cancel_node(state: OrderSubState, config: RunnableConfig) -> Di
 
     steps.append({"agent": "order_agent", "tool": "propose_cancel_order", "args": {"order_no": order_no}})
 
+    verify_card_id = f"tool-verify-cancel-{t_id}"
+    emit_tool_card(
+        card_id=verify_card_id,
+        tool_name="verify_order_status",
+        title=f"核验订单 {order_no} 可取消状态",
+        status="running",
+        summary="正在向 Java order-service 核实订单归属与状态…",
+        input_data={"order_no": order_no},
+    )
+
     token = current_user_ctx.set({
         "user_id": state["user_id"],
         "username": state["username"],
@@ -222,6 +312,20 @@ async def verify_cancel_node(state: OrderSubState, config: RunnableConfig) -> Di
         "tool": "verify_order_status",
         "args": {"orderNo": order_no, "ok": bool(check_res.get("ok"))},
     })
+
+    emit_tool_card(
+        card_id=verify_card_id,
+        tool_name="verify_order_status",
+        title=f"核验订单 {order_no} 可取消状态",
+        status="done" if check_res.get("ok") else "error",
+        summary=(
+            "状态为 UNPAID · 允许发起人工取消确认"
+            if check_res.get("ok")
+            else str(check_res.get("message") or "当前状态不支持直接取消")
+        ),
+        input_data={"order_no": order_no},
+        output_data=check_res,
+    )
 
     if not check_res.get("ok"):
         emit_thought(

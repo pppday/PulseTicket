@@ -6,7 +6,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 
 from app.config import settings
 from app.graph.state import MainGraphState, SharedSlots, get_chat_llm
-from app.graph.thought_stream import emit_thought
+from app.graph.thought_stream import emit_thought, set_token_streaming_enabled
 
 # P0/P3 安全红线：提示词注入与越权改价正则特征库
 _INJECTION_PATTERNS: List[Tuple[re.Pattern, str]] = [
@@ -156,10 +156,20 @@ def extract_deterministic_signals(query: str, prev_slots: Optional[SharedSlots] 
     if m_price:
         slots["max_unit_price"] = float(m_price.group(1))
 
-    # 5. 抽取明确指定的座位 ID 列表 (如 20和21号座位)
-    m_seat_ids = re.search(r"(\d{1,3})\s*(?:和|、|,|与)\s*(\d{1,3})\s*号?座位", q)
-    if m_seat_ids:
-        slots["seat_ids"] = sorted({int(m_seat_ids.group(1)), int(m_seat_ids.group(2))})
+    # 5. 抽取明确指定的座位 ID 列表 (支持 seat_ids=[20] / seat_ids=[20, 21] 与 "20和21号座位" / "20号座位")
+    m_seat_list = re.search(r"seat_ids\s*=\s*\[([\d,\s]+)\]", q, re.IGNORECASE)
+    if m_seat_list:
+        parsed_ids = sorted({int(x.strip()) for x in m_seat_list.group(1).split(",") if x.strip().isdigit()})
+        if parsed_ids:
+            slots["seat_ids"] = parsed_ids
+    else:
+        m_seat_ids = re.search(r"(\d{1,3})\s*(?:和|、|,|与)\s*(\d{1,3})\s*号?座位", q)
+        if m_seat_ids:
+            slots["seat_ids"] = sorted({int(m_seat_ids.group(1)), int(m_seat_ids.group(2))})
+        else:
+            m_single_seat = re.search(r"(?<!\d)(\d{1,3})\s*号座位", q)
+            if m_single_seat:
+                slots["seat_ids"] = [int(m_single_seat.group(1))]
 
     # 6. 抽取演出关键词
     for kw in ("星际回响", "PulseLive", "歌剧魅影", "Phantom", "星际穿越", "Interstellar", "西湖仲夏夜", "梅赛德斯", "天桥", "万象城", "大麦"):
@@ -341,12 +351,24 @@ async def intent_router_node(state: MainGraphState) -> Dict[str, Any]:
         # 离线无 Key 评测或模型波动时平滑回退到确定性路由结果
         final_intents = rule_intents
 
+    mode = (state.get("mode") or "agent").strip().lower()
+    if mode not in ("agent", "chat"):
+        mode = "agent"
+    if mode == "chat":
+        # Chat 模式严格只读咨询，禁止触发任何写操作提交
+        merged_slots["wants_commit"] = False
+
+    if len(final_intents) > 1:
+        # 多意图汇总需要带小标题分区排版，关闭子图内裸 Token 直推改由汇总后统一推送
+        set_token_streaming_enabled(False)
+
     intent_cn = {
         "policy": "规则与场馆问答",
         "purchase": "选座与购票专员",
         "order": "订单与售后专员",
         "chitchat": "常规对话引导",
     }
+    mode_label = "Chat 只读咨询" if mode == "chat" else "Agent 任务执行"
     route_chain = " → ".join(intent_cn.get(i, i) for i in final_intents)
     slot_notes = []
     if merged_slots.get("show_keyword"):
@@ -367,9 +389,9 @@ async def intent_router_node(state: MainGraphState) -> Dict[str, Any]:
         key="router",
         phase="router",
         agent_label="主图路由",
-        title=f"编排调度链路：{route_chain}",
+        title=f"[{mode_label}] 编排调度：{route_chain}",
         detail=f"按确定性优先级拆解为 {len(final_intents)} 个子任务顺序执行{slot_summary}",
-        badges=[intent_cn.get(i, i) for i in final_intents],
+        badges=[mode_label] + [intent_cn.get(i, i) for i in final_intents],
         status="done",
     )
 
@@ -377,11 +399,13 @@ async def intent_router_node(state: MainGraphState) -> Dict[str, Any]:
         "agent": "intent_router",
         "tool": "route_intents",
         "args": {
+            "mode": mode,
             "intents": final_intents,
             "wants_commit": bool(merged_slots.get("wants_commit")),
         },
     }
     return {
+        "mode": mode,
         "intents": final_intents,
         "intent_cursor": 0,
         "slots": merged_slots,

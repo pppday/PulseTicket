@@ -1,17 +1,26 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue'
 import {
+  AlertCircle,
   ArrowUp,
   Check,
+  CheckCircle2,
   ChevronDown,
   Clock,
+  Code2,
+  Copy,
+  Headphones,
   History,
+  Loader2,
   Maximize2,
   Minimize2,
   Plus,
   RotateCcw,
   ShieldCheck,
   Sparkles,
+  Square,
+  ThumbsDown,
+  ThumbsUp,
   Trash2,
   X
 } from 'lucide-vue-next'
@@ -19,11 +28,15 @@ import { api, getToken } from '../api'
 import { refreshAll, state, toast } from '../store'
 import type {
   AgentChatMessage,
+  AgentChatMode,
   AgentConfirmationCard,
+  AgentInteractiveWidget,
   AgentThreadDetailPayload,
   AgentThreadSummary,
   AgentThreadsListPayload,
-  AgentThoughtStep
+  AgentThoughtStep,
+  AgentToolCard,
+  AgentWidgetOption
 } from '../types'
 import { money } from '../utils'
 
@@ -34,6 +47,8 @@ const loadingThreads = ref(false)
 const loadingThreadDetail = ref(false)
 const inputText = ref('')
 const sending = ref(false)
+const chatMode = ref<AgentChatMode>('agent')
+const activeAbortController = ref<AbortController | null>(null)
 const scrollBox = ref<HTMLElement | null>(null)
 
 function makeThreadId() {
@@ -428,6 +443,77 @@ function upsertThoughtStep(msg: AgentChatMessage, incoming: AgentThoughtStep) {
   }
 }
 
+function upsertToolCard(msg: AgentChatMessage, incoming: AgentToolCard) {
+  if (!msg.toolCards) {
+    msg.toolCards = []
+  }
+  const idx = msg.toolCards.findIndex(c => c.id === incoming.id)
+  if (idx >= 0) {
+    const prevExpanded = msg.toolCards[idx].expanded
+    msg.toolCards[idx] = { ...incoming, expanded: prevExpanded }
+  } else {
+    msg.toolCards.push({ ...incoming, expanded: false })
+  }
+}
+
+function upsertWidget(msg: AgentChatMessage, incoming: AgentInteractiveWidget) {
+  if (!msg.widgets) {
+    msg.widgets = []
+  }
+  if (incoming.widgetType === 'SEAT_PICKER') {
+    msg.widgets = msg.widgets.filter(w => w.widgetType !== 'SHOW_PICKER')
+  }
+  const idx = msg.widgets.findIndex(w => w.id === incoming.id)
+  if (idx >= 0) {
+    const prev = msg.widgets[idx]
+    msg.widgets[idx] = {
+      ...incoming,
+      selectedOptionId: prev.selectedOptionId,
+      selectedLabel: prev.selectedLabel
+    }
+  } else {
+    msg.widgets.push({ ...incoming })
+  }
+}
+
+function formatJsonBlock(val: any): string {
+  if (val === undefined) return ''
+  if (typeof val === 'string') return val
+  try {
+    return JSON.stringify(val, null, 2)
+  } catch {
+    return String(val)
+  }
+}
+
+function stopStreaming() {
+  activeAbortController.value?.abort()
+}
+
+async function copyMessage(msg: AgentChatMessage) {
+  if (!msg.content) return
+  try {
+    await navigator.clipboard.writeText(msg.content)
+    msg.copied = true
+    setTimeout(() => {
+      msg.copied = false
+    }, 1500)
+  } catch {
+    toast('info', '复制失败', '当前浏览器环境限制剪贴板写入')
+  }
+}
+
+function setFeedback(msg: AgentChatMessage, val: 'up' | 'down') {
+  msg.feedback = msg.feedback === val ? null : val
+}
+
+async function handleWidgetOptionClick(widget: AgentInteractiveWidget, opt: AgentWidgetOption) {
+  if (sending.value || widget.selectedOptionId) return
+  widget.selectedOptionId = opt.id
+  widget.selectedLabel = opt.label
+  await sendMessage(opt.prompt, { forceMode: 'agent' })
+}
+
 async function consumeSsePost(
   path: string,
   payload: Record<string, any>,
@@ -441,100 +527,131 @@ async function consumeSsePost(
     headers.Authorization = `Bearer ${jwt}`
   }
 
-  const resp = await fetch(path, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(payload)
-  })
+  const controller = new AbortController()
+  activeAbortController.value = controller
 
-  if (!resp.ok || !resp.body) {
-    let errText = `智能体服务暂不可用 (HTTP ${resp.status})`
-    try {
-      const errBody = await resp.json()
-      errText = errBody.detail || errBody.message || errText
-    } catch {
-      // ignore non-json error body
-    }
-    throw new Error(errText)
-  }
+  try {
+    const resp = await fetch(path, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+      signal: controller.signal
+    })
 
-  const reader = resp.body.getReader()
-  const decoder = new TextDecoder('utf-8')
-  let buffer = ''
-
-  while (true) {
-    const { value, done } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
-
-    let boundary = buffer.indexOf('\n\n')
-    while (boundary !== -1) {
-      const rawBlock = buffer.slice(0, boundary)
-      buffer = buffer.slice(boundary + 2)
-      boundary = buffer.indexOf('\n\n')
-
-      let eventType = 'message'
-      let dataStr = ''
-      for (const line of rawBlock.split('\n')) {
-        if (line.startsWith('event:')) {
-          eventType = line.slice(6).trim()
-        } else if (line.startsWith('data:')) {
-          dataStr += line.slice(5).trim()
-        }
-      }
-      if (!dataStr) continue
-
+    if (!resp.ok || !resp.body) {
+      let errText = `智能体服务暂不可用 (HTTP ${resp.status})`
       try {
-        const parsed = JSON.parse(dataStr)
-        if (eventType === 'thought') {
-          upsertThoughtStep(assistantMsg, parsed as AgentThoughtStep)
-        } else if (eventType === 'route') {
-          assistantMsg.intents = parsed.intents || []
-        } else if (eventType === 'step') {
-          assistantMsg.liveStepLabel = parsed.label || parsed.node
-        } else if (eventType === 'token') {
-          // 正文开始流式打印时：若用户没有手动固定展开，自动优雅收起思考抽屉让阅读视线聚焦正文
-          if (!assistantMsg.content && !assistantMsg.userToggledThinking) {
-            assistantMsg.thinkingExpanded = false
-          }
-          assistantMsg.content += parsed.delta || ''
-        } else if (eventType === 'interrupt') {
-          assistantMsg.confirmationCard = parsed.confirmationCard as AgentConfirmationCard
-          assistantMsg.cardDecision = 'PENDING'
-        } else if (eventType === 'done') {
-          if (!assistantMsg.content && parsed.reply) {
-            assistantMsg.content = parsed.reply
-          }
-          assistantMsg.status = parsed.status || 'COMPLETED'
-          assistantMsg.intents = parsed.intents || assistantMsg.intents || []
-          assistantMsg.subgraphs = parsed.subgraphs || []
-          assistantMsg.citations = parsed.citations || []
-          assistantMsg.toolSteps = parsed.toolSteps || []
-          if (Array.isArray(parsed.thinkingSteps) && parsed.thinkingSteps.length) {
-            assistantMsg.thinkingSteps = parsed.thinkingSteps
-          }
-          assistantMsg.latencyMs = parsed.latencyMs
-          if (!assistantMsg.userToggledThinking) {
-            assistantMsg.thinkingExpanded = false
-          }
-          if (parsed.confirmationCard) {
-            assistantMsg.confirmationCard = parsed.confirmationCard
-            assistantMsg.cardDecision = assistantMsg.cardDecision || 'PENDING'
-          }
-        } else if (eventType === 'error') {
-          throw new Error(parsed.message || '智能体流式响应异常')
-        }
-      } catch (e: any) {
-        if (eventType === 'error') throw e
+        const errBody = await resp.json()
+        errText = errBody.detail || errBody.message || errText
+      } catch {
+        // ignore non-json error body
       }
-      scrollToBottom()
+      throw new Error(errText)
+    }
+
+    const reader = resp.body.getReader()
+    const decoder = new TextDecoder('utf-8')
+    let buffer = ''
+
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+
+      let boundary = buffer.indexOf('\n\n')
+      while (boundary !== -1) {
+        const rawBlock = buffer.slice(0, boundary)
+        buffer = buffer.slice(boundary + 2)
+        boundary = buffer.indexOf('\n\n')
+
+        let eventType = 'message'
+        let dataStr = ''
+        for (const line of rawBlock.split('\n')) {
+          if (line.startsWith('event:')) {
+            eventType = line.slice(6).trim()
+          } else if (line.startsWith('data:')) {
+            dataStr += line.slice(5).trim()
+          }
+        }
+        if (!dataStr) continue
+
+        try {
+          const parsed = JSON.parse(dataStr)
+          if (eventType === 'thought') {
+            upsertThoughtStep(assistantMsg, parsed as AgentThoughtStep)
+          } else if (eventType === 'tool_card') {
+            upsertToolCard(assistantMsg, parsed as AgentToolCard)
+          } else if (eventType === 'widget') {
+            upsertWidget(assistantMsg, parsed as AgentInteractiveWidget)
+          } else if (eventType === 'route') {
+            assistantMsg.intents = parsed.intents || []
+            if (parsed.mode) assistantMsg.mode = parsed.mode
+          } else if (eventType === 'step') {
+            assistantMsg.liveStepLabel = parsed.label || parsed.node
+          } else if (eventType === 'token') {
+            // 正文开始流式打印时：若用户没有手动固定展开，自动优雅收起思考抽屉让阅读视线聚焦正文
+            if (!assistantMsg.content && !assistantMsg.userToggledThinking) {
+              assistantMsg.thinkingExpanded = false
+            }
+            assistantMsg.content += parsed.delta || ''
+          } else if (eventType === 'interrupt') {
+            assistantMsg.confirmationCard = parsed.confirmationCard as AgentConfirmationCard
+            assistantMsg.cardDecision = 'PENDING'
+          } else if (eventType === 'done') {
+            if (parsed.reply) {
+              assistantMsg.content = parsed.reply
+            }
+            assistantMsg.status = parsed.status || 'COMPLETED'
+            assistantMsg.mode = parsed.mode || assistantMsg.mode || 'agent'
+            assistantMsg.intents = parsed.intents || assistantMsg.intents || []
+            assistantMsg.subgraphs = parsed.subgraphs || []
+            assistantMsg.citations = parsed.citations || []
+            assistantMsg.toolSteps = parsed.toolSteps || []
+            if (Array.isArray(parsed.thinkingSteps) && parsed.thinkingSteps.length) {
+              assistantMsg.thinkingSteps = parsed.thinkingSteps
+            }
+            if (Array.isArray(parsed.toolCards) && parsed.toolCards.length) {
+              for (const tc of parsed.toolCards) {
+                upsertToolCard(assistantMsg, tc as AgentToolCard)
+              }
+            }
+            if (Array.isArray(parsed.widgets) && parsed.widgets.length) {
+              for (const wg of parsed.widgets) {
+                upsertWidget(assistantMsg, wg as AgentInteractiveWidget)
+              }
+            }
+            assistantMsg.latencyMs = parsed.latencyMs
+            if (!assistantMsg.userToggledThinking) {
+              assistantMsg.thinkingExpanded = false
+            }
+            if (parsed.confirmationCard) {
+              assistantMsg.confirmationCard = parsed.confirmationCard
+              assistantMsg.cardDecision = assistantMsg.cardDecision || 'PENDING'
+            }
+          } else if (eventType === 'error') {
+            throw new Error(parsed.message || '智能体流式响应异常')
+          }
+        } catch (e: any) {
+          if (eventType === 'error') throw e
+        }
+        scrollToBottom()
+      }
+    }
+  } finally {
+    if (activeAbortController.value === controller) {
+      activeAbortController.value = null
     }
   }
 }
 
-async function sendMessage(preset?: string) {
+async function sendMessage(preset?: string, opts?: { forceMode?: AgentChatMode }) {
   const text = (preset ?? inputText.value).trim()
   if (!text || sending.value) return
+
+  if (opts?.forceMode) {
+    chatMode.value = opts.forceMode
+  }
+  const activeMode = chatMode.value
 
   if (!preset) {
     inputText.value = ''
@@ -543,19 +660,23 @@ async function sendMessage(preset?: string) {
   messages.value.push({
     id: `u-${Date.now()}`,
     role: 'user',
-    content: text
+    content: text,
+    mode: activeMode
   })
 
   const assistantMsg: AgentChatMessage = {
     id: `a-${Date.now() + 1}`,
     role: 'assistant',
     content: '',
+    mode: activeMode,
     streaming: true,
-    liveStepLabel: '正在经过安全护栏与主图路由…',
+    liveStepLabel: activeMode === 'chat' ? 'Chat 只读咨询模式检索中…' : '正在经过安全护栏与主图路由…',
     intents: [],
     citations: [],
     toolSteps: [],
     thinkingSteps: [],
+    toolCards: [],
+    widgets: [],
     thinkingExpanded: true,
     userToggledThinking: false
   }
@@ -567,15 +688,23 @@ async function sendMessage(preset?: string) {
   try {
     await consumeSsePost(
       '/api/agent/chat/stream',
-      { threadId: threadId.value, message: text },
+      { threadId: threadId.value, message: text, mode: activeMode },
       reactiveAssistant
     )
     saveActiveThreadId(threadId.value)
     await loadThreads()
   } catch (err: any) {
-    reactiveAssistant.status = 'ERROR'
-    reactiveAssistant.content =
-      err?.message || '智能体服务 (:8204) 未启动或网关连接异常，请稍后重试。'
+    if (err?.name === 'AbortError') {
+      reactiveAssistant.aborted = true
+      reactiveAssistant.status = 'COMPLETED'
+      if (!reactiveAssistant.content) {
+        reactiveAssistant.content = '已手动停止当前生成。'
+      }
+    } else {
+      reactiveAssistant.status = 'ERROR'
+      reactiveAssistant.content =
+        err?.message || '智能体服务 (:8204) 未启动或网关连接异常，请稍后重试。'
+    }
   } finally {
     reactiveAssistant.streaming = false
     reactiveAssistant.liveStepLabel = undefined
@@ -596,9 +725,12 @@ async function handleCardDecision(msg: AgentChatMessage, confirmed: boolean) {
     id: `r-${Date.now()}`,
     role: 'assistant',
     content: '',
+    mode: 'agent',
     streaming: true,
     liveStepLabel: confirmed ? '正在携带幂等键请求 Java 订单服务…' : '正在释放挂起确认态…',
     thinkingSteps: [],
+    toolCards: [],
+    widgets: [],
     thinkingExpanded: true,
     userToggledThinking: false
   }
@@ -621,9 +753,16 @@ async function handleCardDecision(msg: AgentChatMessage, confirmed: boolean) {
       toast('success', '锁座与订单状态已同步', '座位图与我的订单已实时刷新')
     }
   } catch (err: any) {
-    msg.cardDecision = 'PENDING'
-    reactiveReceipt.status = 'ERROR'
-    reactiveReceipt.content = err?.message || '确认请求超时，请重试（幂等键保障绝不重复创单）'
+    if (err?.name === 'AbortError') {
+      msg.cardDecision = 'PENDING'
+      reactiveReceipt.aborted = true
+      reactiveReceipt.status = 'COMPLETED'
+      reactiveReceipt.content = '已手动停止接收执行回执，如已提交请在「我的订单」确认最新状态。'
+    } else {
+      msg.cardDecision = 'PENDING'
+      reactiveReceipt.status = 'ERROR'
+      reactiveReceipt.content = err?.message || '确认请求超时，请重试（幂等键保障绝不重复创单）'
+    }
   } finally {
     reactiveReceipt.streaming = false
     reactiveReceipt.liveStepLabel = undefined
@@ -679,11 +818,17 @@ async function handleCardDecision(msg: AgentChatMessage, confirmed: boolean) {
               <div class="flex items-center gap-2">
                 <h3 class="text-[14px] font-semibold tracking-tight text-ink">PulseTicket 智能顾问</h3>
                 <span class="rounded-full border border-line bg-white px-2 py-0.5 font-mono text-[10px] text-ink-soft">
-                  Multi-Agent
+                  {{ chatMode === 'chat' ? 'Chat' : 'Agent' }}
                 </span>
               </div>
               <p class="mt-0.5 text-[11px] text-ink-mute">
-                {{ sending ? '正在深度思考与调度子图…' : '主图意图路由 · 3轮轻量记忆 · 7天历史恢复' }}
+                {{
+                  sending
+                    ? (chatMode === 'chat' ? '正在实时检索并流式生成…' : '正在编排子图与执行工具调用…')
+                    : (chatMode === 'chat'
+                        ? 'Chat 只读咨询 · 真流式输出 · 7 天历史'
+                        : 'Agent 任务执行 · 工具卡片 · 交互选择框')
+                }}
               </p>
             </div>
           </div>
@@ -969,7 +1114,81 @@ async function handleCardDecision(msg: AgentChatMessage, confirmed: boolean) {
                 </div>
               </div>
 
-              <!-- 2. Main Editorial Answer Card -->
+              <!-- 2. Inline Tool Execution Cards (with </> JSON Inspector) -->
+              <div
+                v-if="msg.toolCards && msg.toolCards.length"
+                class="space-y-2"
+              >
+                <div
+                  v-for="card in msg.toolCards"
+                  :key="card.id"
+                  class="overflow-hidden rounded-2xl border border-line bg-white shadow-[0_1px_2px_rgba(26,25,23,0.03)]"
+                >
+                  <div class="flex items-center justify-between gap-2 px-3.5 py-2.5">
+                    <div class="flex min-w-0 items-center gap-2">
+                      <Loader2
+                        v-if="card.status === 'running'"
+                        class="h-4 w-4 shrink-0 animate-spin text-gold"
+                      />
+                      <CheckCircle2
+                        v-else-if="card.status === 'done'"
+                        class="h-4 w-4 shrink-0 text-sage"
+                      />
+                      <AlertCircle
+                        v-else
+                        class="h-4 w-4 shrink-0 text-brick"
+                      />
+                      <span class="truncate text-[12px] font-medium text-ink">
+                        {{ card.title }}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      class="grid h-6 w-7 shrink-0 place-items-center rounded-md border text-[11px] transition"
+                      :class="
+                        card.expanded
+                          ? 'border-ink/30 bg-paper text-ink'
+                          : 'border-line bg-white text-ink-mute hover:border-ink/25 hover:text-ink'
+                      "
+                      title="查看工具入参 / 返回结果 JSON"
+                      @click="card.expanded = !card.expanded"
+                    >
+                      <Code2 class="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+
+                  <div
+                    v-if="card.summary"
+                    class="border-t border-line/60 bg-[#FAF9F6] px-3.5 py-2 text-[11.5px] leading-snug"
+                    :class="card.status === 'error' ? 'text-brick' : 'text-ink-soft'"
+                  >
+                    <span class="mr-1 font-medium">
+                      {{ card.status === 'done' ? '✓' : card.status === 'error' ? '✕' : '…' }}
+                    </span>
+                    {{ card.summary }}
+                  </div>
+
+                  <div
+                    v-if="card.expanded"
+                    class="space-y-2 border-t border-line/70 bg-[#1A1917] px-3.5 py-2.5 font-mono text-[10.5px] leading-relaxed text-[#EDE9E0]"
+                  >
+                    <div v-if="card.input !== undefined">
+                      <div class="mb-0.5 text-[9.5px] uppercase tracking-wider text-[#B6AF9F]">
+                        Input · {{ card.toolName }}
+                      </div>
+                      <pre class="max-h-32 overflow-auto whitespace-pre-wrap break-all">{{ formatJsonBlock(card.input) }}</pre>
+                    </div>
+                    <div v-if="card.output !== undefined">
+                      <div class="mb-0.5 text-[9.5px] uppercase tracking-wider text-[#9BC4AE]">
+                        Output
+                      </div>
+                      <pre class="max-h-40 overflow-auto whitespace-pre-wrap break-all">{{ formatJsonBlock(card.output) }}</pre>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 3. Main Editorial Answer Card -->
               <div
                 v-if="msg.content"
                 class="rounded-2xl rounded-tl-md border px-4 py-3.5 text-[12.5px] shadow-[0_1px_2px_rgba(26,25,23,0.03)]"
@@ -979,7 +1198,68 @@ async function handleCardDecision(msg: AgentChatMessage, confirmed: boolean) {
                     : 'border-line bg-white text-ink'
                 "
               >
-                <div class="editorial-prose" v-html="renderEditorialMarkdown(msg.content)" />
+                <div class="editorial-prose inline" v-html="renderEditorialMarkdown(msg.content)" />
+                <span
+                  v-if="msg.streaming"
+                  class="ml-1 inline-block h-3.5 w-1.5 animate-pulse rounded-sm bg-ink/70 align-middle"
+                />
+              </div>
+
+              <!-- 4. Embedded Interactive Selection Widgets -->
+              <div
+                v-for="wg in (msg.widgets || [])"
+                :key="wg.id"
+                class="rounded-2xl border border-line bg-white p-3.5 shadow-[0_1px_2px_rgba(26,25,23,0.03)]"
+              >
+                <div class="flex items-start justify-between gap-2">
+                  <div>
+                    <p class="text-[12px] font-semibold text-ink">{{ wg.title }}</p>
+                    <p v-if="wg.subtitle" class="mt-0.5 text-[11px] text-ink-mute">
+                      {{ wg.subtitle }}
+                    </p>
+                  </div>
+                </div>
+
+                <!-- Selected State (In-Place Confirmation Stamp) -->
+                <div
+                  v-if="wg.selectedOptionId"
+                  class="mt-2.5 flex items-center gap-1.5 rounded-xl border border-sage/25 bg-sage-soft/55 px-3 py-2 text-[11.5px] font-medium text-sage"
+                >
+                  <CheckCircle2 class="h-3.5 w-3.5 shrink-0" />
+                  <span class="truncate">已选择：{{ wg.selectedLabel }}</span>
+                </div>
+
+                <!-- Option Picker Buttons -->
+                <div v-else class="mt-2.5 space-y-1.5">
+                  <button
+                    v-for="opt in wg.options"
+                    :key="opt.id"
+                    type="button"
+                    :disabled="sending"
+                    class="group flex w-full items-center justify-between gap-2 rounded-xl border border-line bg-[#FAF9F6] px-3 py-2 text-left transition hover:border-ink/40 hover:bg-white disabled:cursor-not-allowed disabled:opacity-50"
+                    @click="handleWidgetOptionClick(wg, opt)"
+                  >
+                    <div class="min-w-0 flex-1">
+                      <div class="flex items-center gap-1.5">
+                        <span
+                          v-if="opt.badge"
+                          class="shrink-0 rounded border border-gold/30 bg-gold-soft/75 px-1.5 py-0.2 font-mono text-[10px] font-medium text-gold"
+                        >
+                          {{ opt.badge }}
+                        </span>
+                        <span class="truncate text-[11.5px] font-medium text-ink group-hover:text-black">
+                          {{ opt.label }}
+                        </span>
+                      </div>
+                      <p v-if="opt.meta" class="mt-0.5 truncate text-[10.5px] text-ink-mute">
+                        {{ opt.meta }}
+                      </p>
+                    </div>
+                    <span class="shrink-0 text-[11px] font-medium text-ink-soft group-hover:text-ink">
+                      选择 →
+                    </span>
+                  </button>
+                </div>
               </div>
 
               <!-- 3. Perforated Theater-Stub Confirmation Card (Interrupt Gate) -->
@@ -1095,37 +1375,157 @@ async function handleCardDecision(msg: AgentChatMessage, confirmed: boolean) {
                     class="mt-3 flex items-center justify-center gap-1.5 rounded-xl bg-paper py-2 text-[11px] font-medium"
                     :class="msg.cardDecision === 'CONFIRMED' ? 'text-sage' : 'text-ink-mute'"
                   >
-                    <Check v-if="msg.cardDecision === 'CONFIRMED'" class="h-3.5 w-3.5" />
-                    {{ msg.cardDecision === 'CONFIRMED' ? '已确认提交 · 单次防重锁定生效' : '已取消该次操作' }}
+                    <CheckCircle2 v-if="msg.cardDecision === 'CONFIRMED'" class="h-3.5 w-3.5" />
+                    {{
+                      msg.cardDecision === 'CONFIRMED'
+                        ? `已选择：${msg.confirmationCard.actionType === 'CREATE_ORDER' ? '确认锁座下单' : '确认取消订单'}（单次防重锁定生效）`
+                        : '已选择：暂不执行'
+                    }}
                   </div>
                 </div>
+              </div>
+
+              <!-- 6. Feedback & Copy Toolbar -->
+              <div
+                v-if="!msg.streaming && msg.content"
+                class="flex items-center gap-1.5 px-1"
+              >
+                <button
+                  type="button"
+                  class="grid h-6 w-6 place-items-center rounded-md border transition"
+                  :class="
+                    msg.feedback === 'up'
+                      ? 'border-sage/40 bg-sage-soft/50 text-sage'
+                      : 'border-line/80 bg-white text-ink-mute hover:text-ink'
+                  "
+                  title="有帮助"
+                  @click="setFeedback(msg, 'up')"
+                >
+                  <ThumbsUp class="h-3 w-3" />
+                </button>
+                <button
+                  type="button"
+                  class="grid h-6 w-6 place-items-center rounded-md border transition"
+                  :class="
+                    msg.feedback === 'down'
+                      ? 'border-brick/40 bg-brick-soft/50 text-brick'
+                      : 'border-line/80 bg-white text-ink-mute hover:text-ink'
+                  "
+                  title="需改进"
+                  @click="setFeedback(msg, 'down')"
+                >
+                  <ThumbsDown class="h-3 w-3" />
+                </button>
+                <button
+                  type="button"
+                  class="inline-flex h-6 items-center gap-1 rounded-md border border-line/80 bg-white px-2 text-[10.5px] text-ink-mute transition hover:text-ink"
+                  title="复制回复内容"
+                  @click="copyMessage(msg)"
+                >
+                  <Check v-if="msg.copied" class="h-3 w-3 text-sage" />
+                  <Copy v-else class="h-3 w-3" />
+                  <span v-if="msg.copied" class="text-sage">已复制</span>
+                </button>
+              </div>
+
+              <!-- 7. Task Completion Banner (Agent Mode with Tool Executions) -->
+              <div
+                v-if="
+                  msg.mode !== 'chat' &&
+                  msg.status === 'COMPLETED' &&
+                  !msg.streaming &&
+                  !msg.aborted &&
+                  !msg.confirmationCard &&
+                  ((msg.toolCards && msg.toolCards.length) || (msg.toolSteps && msg.toolSteps.length))
+                "
+                class="flex items-center gap-1.5 rounded-xl border border-sage/25 bg-sage-soft/50 px-3 py-2 text-[11.5px] font-medium text-sage"
+              >
+                <CheckCircle2 class="h-3.5 w-3.5 shrink-0" />
+                <span>本次对话任务执行完成</span>
               </div>
             </div>
           </template>
         </div>
 
-        <!-- Refined Input Composer -->
+        <!-- Refined Aliyun-Style Input Composer with Agent / Chat Toggle -->
         <form
-          class="border-t border-line bg-white px-4 py-3"
+          class="border-t border-line bg-white px-4 pb-2.5 pt-3"
           @submit.prevent="sendMessage()"
         >
-          <div class="flex items-center gap-2 rounded-2xl border border-line bg-[#FAF9F6] px-3.5 py-1.5 transition focus-within:border-ink/40 focus-within:bg-white focus-within:shadow-[0_0_0_3px_rgba(26,25,23,0.04)]">
-            <input
+          <div class="rounded-2xl border border-line bg-[#FAF9F6] px-3.5 pb-2 pt-2.5 transition focus-within:border-ink/40 focus-within:bg-white focus-within:shadow-[0_0_0_3px_rgba(26,25,23,0.04)]">
+            <textarea
               v-model="inputText"
-              type="text"
+              rows="2"
               :disabled="sending"
-              placeholder="咨询退改与地铁、筛选连座，或输入“锁座下单”…"
-              class="h-8 flex-1 bg-transparent text-xs text-ink placeholder:text-ink-mute focus:outline-none disabled:opacity-50"
+              :placeholder="
+                chatMode === 'chat'
+                  ? 'Chat 只读咨询：查演出、问退票/地铁规则、测算退票费率…'
+                  : '咨询退改与地铁、筛选连座，或输入“锁座下单”…'
+              "
+              class="w-full resize-none bg-transparent text-xs leading-relaxed text-ink placeholder:text-ink-mute focus:outline-none disabled:opacity-50"
+              @keydown.enter.exact.prevent="sendMessage()"
             />
-            <button
-              type="submit"
-              :disabled="!inputText.trim() || sending"
-              class="grid h-8 w-8 shrink-0 place-items-center rounded-xl bg-ink text-white transition hover:bg-black disabled:cursor-not-allowed disabled:opacity-30"
-              aria-label="发送消息"
-            >
-              <ArrowUp class="h-3.5 w-3.5" />
-            </button>
+
+            <div class="mt-1.5 flex items-center justify-between border-t border-line/60 pt-2">
+              <!-- Mode Segmented Switch -->
+              <div class="inline-flex items-center gap-1 rounded-xl border border-line bg-white p-0.5">
+                <button
+                  type="button"
+                  :disabled="sending"
+                  class="inline-flex items-center gap-1 rounded-lg px-2.5 py-1 text-[11px] font-medium transition disabled:opacity-50"
+                  :class="
+                    chatMode === 'agent'
+                      ? 'bg-ink text-white shadow-sm'
+                      : 'text-ink-soft hover:text-ink'
+                  "
+                  title="Agent 模式：支持工具调用、选座/下单选择框与分布式锁座确认"
+                  @click="chatMode = 'agent'"
+                >
+                  <Sparkles class="h-3 w-3" />
+                  <span>Agent</span>
+                </button>
+                <button
+                  type="button"
+                  :disabled="sending"
+                  class="inline-flex items-center gap-1 rounded-lg px-2.5 py-1 text-[11px] font-medium transition disabled:opacity-50"
+                  :class="
+                    chatMode === 'chat'
+                      ? 'bg-ink text-white shadow-sm'
+                      : 'text-ink-soft hover:text-ink'
+                  "
+                  title="Chat 模式：只读咨询与规章检索，真流式秒回，不触发写操作"
+                  @click="chatMode = 'chat'"
+                >
+                  <Headphones class="h-3 w-3" />
+                  <span>Chat</span>
+                </button>
+              </div>
+
+              <!-- Stop or Send Button -->
+              <button
+                v-if="sending"
+                type="button"
+                class="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-ink text-white transition hover:bg-black"
+                aria-label="停止生成"
+                title="停止当前生成"
+                @click="stopStreaming"
+              >
+                <Square class="h-3 w-3 fill-current" />
+              </button>
+              <button
+                v-else
+                type="submit"
+                :disabled="!inputText.trim()"
+                class="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-ink text-white transition hover:bg-black disabled:cursor-not-allowed disabled:opacity-30"
+                aria-label="发送消息"
+              >
+                <ArrowUp class="h-3.5 w-3.5" />
+              </button>
+            </div>
           </div>
+          <p class="mt-1.5 text-center text-[10px] text-ink-mute">
+            内容由 AI 生成，仅供参考；锁座与票价均以 Java 服务端实时核价为准
+          </p>
         </form>
       </section>
     </Transition>

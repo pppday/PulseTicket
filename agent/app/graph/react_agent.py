@@ -489,6 +489,7 @@ class TicketAgentManager:
         user_id: int,
         username: str,
         user_role: str = "USER",
+        mode: str = "agent",
     ) -> Dict[str, Any]:
         user_info = self._validate_user(user_id, username, user_role)
         if self.graph is None:

@@ -17,7 +17,7 @@ from langgraph.types import Command, interrupt
 from app.config import settings
 from app.graph.guard_and_router import input_guard_node, intent_router_node
 from app.graph.state import MainGraphState, SubTaskResult, get_chat_llm
-from app.graph.thought_stream import ThoughtSession, emit_thought
+from app.graph.thought_stream import ThoughtSession, astream_llm_text, emit_thought, emit_tool_card
 from app.graph.subgraphs import (
     build_knowledge_subgraph,
     build_order_subgraph,
@@ -102,6 +102,7 @@ async def run_purchase_subgraph(state: MainGraphState, config: RunnableConfig) -
             "sub_messages": [],
             "query": state.get("current_query") or "",
             "history_summary": state.get("history_summary") or "",
+            "mode": state.get("mode") or "agent",
             "slots": dict(state.get("slots") or {}),
             "user_id": state["user_id"],
             "username": state["username"],
@@ -141,6 +142,7 @@ async def run_order_subgraph(state: MainGraphState, config: RunnableConfig) -> D
             "sub_messages": [],
             "query": state.get("current_query") or "",
             "history_summary": state.get("history_summary") or "",
+            "mode": state.get("mode") or "agent",
             "slots": dict(state.get("slots") or {}),
             "user_id": state["user_id"],
             "username": state["username"],
@@ -187,11 +189,14 @@ async def chitchat_node(state: MainGraphState) -> Dict[str, Any]:
         "3. 查询个人订单、核算退票费用或取消未支付锁座单。"
     )
     try:
-        resp = await get_chat_llm(temperature=0.3).ainvoke([
-            SystemMessage(content=sys_msg),
-            HumanMessage(content=q),
-        ])
-        reply = str(resp.content or "").strip()
+        raw_reply = await astream_llm_text(
+            get_chat_llm(temperature=0.3),
+            [
+                SystemMessage(content=sys_msg),
+                HumanMessage(content=q),
+            ],
+        )
+        reply = raw_reply.strip()
     except Exception:
         reply = (
             "您好！我是 PulseTicket 智能购票助手。我可以帮您查演出、推荐最佳中间连座、"
@@ -291,6 +296,12 @@ async def confirm_action_node(state: MainGraphState) -> Dict[str, Any]:
             }],
         }
 
+    exec_card_id = f"tool-exec-{t_name}"
+    exec_card_title = (
+        "执行分布式锁座下单 (Redisson + Seata AT)"
+        if t_name == "propose_create_order"
+        else "执行未支付订单取消与座位释放"
+    )
     emit_thought(
         key="confirm-exec",
         phase="confirm",
@@ -299,6 +310,14 @@ async def confirm_action_node(state: MainGraphState) -> Dict[str, Any]:
         detail=f"Idempotency-Key: {idempotency_key}",
         badges=["Seata AT", "Redisson"],
         status="running",
+    )
+    emit_tool_card(
+        card_id=exec_card_id,
+        tool_name=t_name,
+        title=exec_card_title,
+        status="running",
+        summary="正在携带幂等键调用 Java order-service 事务下单/关单…",
+        input_data={"idempotencyKey": idempotency_key, **exec_args},
     )
     token = current_user_ctx.set({
         "user_id": state["user_id"],
@@ -326,6 +345,23 @@ async def confirm_action_node(state: MainGraphState) -> Dict[str, Any]:
         detail=exec_res.get("message", ""),
         badges=[str(exec_res.get("orderNo") or "FAILED")],
         status="done" if exec_res.get("success") else "warn",
+    )
+    emit_tool_card(
+        card_id=exec_card_id,
+        tool_name=t_name,
+        title=exec_card_title,
+        status="done" if exec_res.get("success") else "error",
+        summary=(
+            f"已创建锁座订单 {exec_res.get('orderNo')}（总额 ¥{exec_res.get('totalAmount')}）"
+            if t_name == "propose_create_order" and exec_res.get("success")
+            else (
+                f"已取消订单 {exec_res.get('orderNo')} 并释放座位"
+                if exec_res.get("success")
+                else str(exec_res.get("message") or "后端服务处理失败")
+            )
+        ),
+        input_data={"idempotencyKey": idempotency_key, **exec_args},
+        output_data=exec_res,
     )
 
     steps.append({
@@ -730,7 +766,10 @@ class MultiAgentTicketManager:
         user_message: str,
         config: Dict[str, Any],
         t0: float,
+        mode: Optional[str] = None,
         thinking_steps: Optional[List[Dict[str, Any]]] = None,
+        tool_cards: Optional[List[Dict[str, Any]]] = None,
+        widgets: Optional[List[Dict[str, Any]]] = None,
         resolve_pending_decision: Optional[str] = None,
         record_user_msg: bool = True,
     ) -> Dict[str, Any]:
@@ -738,6 +777,9 @@ class MultiAgentTicketManager:
         vals = snapshot.values if (snapshot and snapshot.values) else {}
         is_interrupted = bool(snapshot and snapshot.next)
         confirmation_card = _extract_interrupt_card(snapshot)
+
+        raw_mode = mode or vals.get("mode") or "agent"
+        eff_mode = "chat" if str(raw_mode).strip().lower() == "chat" else "agent"
 
         intents = vals.get("intents") or []
         subgraphs = vals.get("executed_subgraphs") or []
@@ -783,10 +825,13 @@ class MultiAgentTicketManager:
             user_message=user_message,
             assistant_reply=reply_text,
             status=status,
+            mode=eff_mode,
             intents=intents,
             subgraphs=subgraphs,
             citations=citations,
             thinking_steps=list(thinking_steps or []),
+            tool_cards=list(tool_cards or []),
+            widgets=list(widgets or []),
             confirmation_card=confirmation_card,
             latency_ms=latency_ms,
             record_user_msg=record_user_msg,
@@ -799,12 +844,15 @@ class MultiAgentTicketManager:
             "traceId": trace_id,
             "threadId": thread_id,
             "status": status,
+            "mode": eff_mode,
             "reply": reply_text,
             "intents": intents,
             "subgraphs": subgraphs,
             "citations": citations,
             "toolSteps": tool_steps,
             "thinkingSteps": list(thinking_steps or []),
+            "toolCards": list(tool_cards or []),
+            "widgets": list(widgets or []),
             "confirmationCard": confirmation_card,
             "latencyMs": latency_ms,
         }
@@ -816,9 +864,11 @@ class MultiAgentTicketManager:
         user_id: int,
         username: str,
         user_role: str = "USER",
+        mode: str = "agent",
     ) -> Dict[str, Any]:
         t0 = time.perf_counter()
         trace_id = f"ag-{uuid.uuid4().hex[:12]}"
+        norm_mode = "chat" if str(mode or "").strip().lower() == "chat" else "agent"
         user_info = self._validate_user(user_id, username, user_role)
         if self.graph is None:
             await self.startup()
@@ -848,7 +898,10 @@ class MultiAgentTicketManager:
                             user_message=user_message,
                             config=config,
                             t0=t0,
+                            mode=norm_mode,
                             thinking_steps=ts.steps,
+                            tool_cards=ts.tool_cards,
+                            widgets=ts.widgets,
                             resolve_pending_decision="REJECTED",
                         )
                 else:
@@ -875,10 +928,13 @@ class MultiAgentTicketManager:
                         user_message=user_message,
                         assistant_reply=hold_reply,
                         status="INTERRUPTED",
+                        mode=norm_mode,
                         intents=[],
                         subgraphs=["pending_resolver"],
                         citations=[],
                         thinking_steps=list(ts.steps),
+                        tool_cards=[],
+                        widgets=[],
                         confirmation_card=pending_card,
                         latency_ms=latency_ms,
                         preserve_existing_pending=True,
@@ -889,12 +945,15 @@ class MultiAgentTicketManager:
                         "traceId": trace_id,
                         "threadId": thread_id,
                         "status": "INTERRUPTED",
+                        "mode": norm_mode,
                         "reply": hold_reply,
                         "intents": [],
                         "subgraphs": ["pending_resolver"],
                         "citations": [],
                         "toolSteps": [],
                         "thinkingSteps": list(ts.steps),
+                        "toolCards": [],
+                        "widgets": [],
                         "confirmationCard": pending_card,
                         "latencyMs": latency_ms,
                     }
@@ -902,6 +961,7 @@ class MultiAgentTicketManager:
             input_state: MainGraphState = {
                 "messages": [HumanMessage(content=user_message)],
                 "current_query": user_message,
+                "mode": norm_mode,
                 "user_id": user_info["user_id"],
                 "username": user_info["username"],
                 "user_role": user_info["user_role"],
@@ -915,7 +975,10 @@ class MultiAgentTicketManager:
                 user_message=user_message,
                 config=config,
                 t0=t0,
+                mode=norm_mode,
                 thinking_steps=ts.steps,
+                tool_cards=ts.tool_cards,
+                widgets=ts.widgets,
                 resolve_pending_decision=pending_resolved,
             )
 
@@ -966,10 +1029,12 @@ class MultiAgentTicketManager:
         user_id: int,
         username: str,
         user_role: str = "USER",
+        mode: str = "agent",
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """SSE 流式对话生成器：零延迟推送子图细粒度 thought 思考步骤、路由、逐块文本与确认卡片事件"""
+        """SSE 流式对话生成器：零延迟推送子图 thought 思考步骤、tool_card 工具卡片、widget 选择框、真实 Token 流与确认卡片"""
         t0 = time.perf_counter()
         trace_id = f"ag-{uuid.uuid4().hex[:12]}"
+        norm_mode = "chat" if str(mode or "").strip().lower() == "chat" else "agent"
         user_info = self._validate_user(user_id, username, user_role)
         if self.graph is None:
             await self.startup()
@@ -983,9 +1048,13 @@ class MultiAgentTicketManager:
             prev_snap = await self.graph.aget_state(config)
 
         if prev_snap and prev_snap.next:
-            res = await self.chat(thread_id, user_message, user_id, username, user_role)
+            res = await self.chat(thread_id, user_message, user_id, username, user_role, mode=norm_mode)
             for th in res.get("thinkingSteps") or []:
                 yield {"event": "thought", "data": th}
+            for tc in res.get("toolCards") or []:
+                yield {"event": "tool_card", "data": tc}
+            for wg in res.get("widgets") or []:
+                yield {"event": "widget", "data": wg}
             yield {"event": "token", "data": {"delta": res["reply"]}}
             if res.get("confirmationCard"):
                 yield {"event": "interrupt", "data": {"confirmationCard": res["confirmationCard"]}}
@@ -995,12 +1064,13 @@ class MultiAgentTicketManager:
         input_state: MainGraphState = {
             "messages": [HumanMessage(content=user_message)],
             "current_query": user_message,
+            "mode": norm_mode,
             "user_id": user_info["user_id"],
             "username": user_info["username"],
             "user_role": user_info["user_role"],
         }
 
-        with ThoughtSession(use_queue=True) as ts:
+        with ThoughtSession(use_queue=True, stream_tokens=True) as ts:
             assert ts.queue is not None
             sentinel = {"event": "__end__", "data": {}}
 
@@ -1017,6 +1087,7 @@ class MultiAgentTicketManager:
                                     "data": {
                                         "intents": node_val.get("intents") or [],
                                         "slots": node_val.get("slots") or {},
+                                        "mode": node_val.get("mode") or norm_mode,
                                     },
                                 })
                             ts.queue.put_nowait({
@@ -1042,14 +1113,19 @@ class MultiAgentTicketManager:
                 user_message=user_message,
                 config=config,
                 t0=t0,
+                mode=norm_mode,
                 thinking_steps=ts.steps,
+                tool_cards=ts.tool_cards,
+                widgets=ts.widgets,
             )
 
-        text = final_payload.get("reply") or ""
-        step_size = 16
-        for idx in range(0, len(text), step_size):
-            yield {"event": "token", "data": {"delta": text[idx : idx + step_size]}}
-            await asyncio.sleep(0.01)
+            # 若本次走了确定性文案/拒答/多意图汇总/中断卡片，未在子图内推流 Token，则按块补推文本
+            if not ts.has_streamed_tokens:
+                text = final_payload.get("reply") or ""
+                step_size = 16
+                for idx in range(0, len(text), step_size):
+                    yield {"event": "token", "data": {"delta": text[idx : idx + step_size]}}
+                    await asyncio.sleep(0.01)
 
         if final_payload.get("confirmationCard"):
             yield {
@@ -1084,7 +1160,7 @@ class MultiAgentTicketManager:
         if not prev_snap or not prev_snap.next:
             raise ValueError(f"会话 {thread_id} 当前没有处于等待人工确认的挂起操作")
 
-        with ThoughtSession(use_queue=True) as ts:
+        with ThoughtSession(use_queue=True, stream_tokens=False) as ts:
             assert ts.queue is not None
             sentinel = {"event": "__end__", "data": {}}
 
@@ -1110,7 +1186,10 @@ class MultiAgentTicketManager:
                 user_message=f"[CARD_CONFIRM={confirmed}]",
                 config=config,
                 t0=t0,
+                mode="agent",
                 thinking_steps=ts.steps,
+                tool_cards=ts.tool_cards,
+                widgets=ts.widgets,
                 resolve_pending_decision="CONFIRMED" if confirmed else "REJECTED",
                 record_user_msg=False,
             )

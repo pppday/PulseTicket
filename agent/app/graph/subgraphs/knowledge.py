@@ -5,7 +5,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 
 from app.graph.state import SharedSlots, get_chat_llm
-from app.graph.thought_stream import emit_thought
+from app.graph.thought_stream import astream_llm_text, emit_thought, emit_token, emit_tool_card
 from app.rag.hybrid_rag import hybrid_rag_engine, tokenize_zh
 
 # 知识库明确未覆盖的高频越界业务词（用于精确识别“知识库盲区”，杜绝模型自由发挥编造政策）
@@ -112,6 +112,15 @@ async def hybrid_retrieve_node(state: KnowledgeSubState) -> Dict[str, Any]:
         detail=f"执行 {pipeline_desc}",
         status="running",
     )
+    rag_card_id = f"tool-rag-{retry + 1}"
+    emit_tool_card(
+        card_id=rag_card_id,
+        tool_name="search_ticket_policy",
+        title="检索官方票务知识库 (Hybrid RAG)",
+        status="running",
+        summary=f"正在执行 {pipeline_desc}…",
+        input_data={"query": rq, "top_k": 3, "attempt": retry + 1},
+    )
     hits = await hybrid_rag_engine.search(rq, top_k=3)
 
     top_code = hits[0]["docCode"] if hits else "NONE"
@@ -125,6 +134,30 @@ async def hybrid_retrieve_node(state: KnowledgeSubState) -> Dict[str, Any]:
         detail=f"Top-1 条款 [{top_code}]（RRF 融合得分 {top_score}），共召回 {len(hits)} 个候选语义块",
         badges=[top_code, f"Score {top_score}"],
         status="done",
+    )
+    emit_tool_card(
+        card_id=rag_card_id,
+        tool_name="search_ticket_policy",
+        title="检索官方票务知识库 (Hybrid RAG)",
+        status="done",
+        summary=(
+            f"命中《{top_title}》[{top_code}]（融合得分 {top_score}，共 {len(hits)} 条）"
+            if hits
+            else "未检索到高置信度官方条款"
+        ),
+        input_data={"query": rq, "top_k": 3, "attempt": retry + 1},
+        output_data={
+            "backend": binfo,
+            "hits": [
+                {
+                    "docCode": h.get("docCode"),
+                    "docTitle": h.get("docTitle"),
+                    "score": h.get("finalScore"),
+                    "excerpt": str(h.get("content") or "")[:240],
+                }
+                for h in hits
+            ],
+        },
     )
 
     steps = list(state.get("tool_steps") or [])
@@ -246,11 +279,14 @@ async def generate_answer_node(state: KnowledgeSubState) -> Dict[str, Any]:
     answer_text = ""
     try:
         llm = get_chat_llm(temperature=0.1)
-        resp = await llm.ainvoke([
-            SystemMessage(content=sys_prompt),
-            HumanMessage(content=f"【检索证据】:\n{evidence_text}\n\n【用户问题】:\n{raw_q}"),
-        ])
-        answer_text = str(resp.content or "").strip()
+        raw_ans = await astream_llm_text(
+            llm,
+            [
+                SystemMessage(content=sys_prompt),
+                HumanMessage(content=f"【检索证据】:\n{evidence_text}\n\n【用户问题】:\n{raw_q}"),
+            ],
+        )
+        answer_text = raw_ans.strip()
     except Exception:
         # 离线无 LLM Key 时使用证据摘要确定性输出
         top = hits[0]
@@ -262,7 +298,9 @@ async def generate_answer_node(state: KnowledgeSubState) -> Dict[str, Any]:
     found_codes = re.findall(r"POL-[A-Z]+-\d+", answer_text)
     if not found_codes and available_codes:
         primary_code = available_codes[0]
-        answer_text = f"{answer_text} `[{primary_code}]`"
+        suffix = f" `[{primary_code}]`"
+        answer_text = f"{answer_text}{suffix}"
+        emit_token(suffix)
         found_codes = [primary_code]
 
     dedup_codes = list(dict.fromkeys(found_codes))

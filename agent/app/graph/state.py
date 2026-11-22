@@ -45,6 +45,7 @@ class MainGraphState(TypedDict, total=False):
     user_role: str
 
     current_query: str
+    mode: str
     guard_blocked: bool
     guard_reason: str
 

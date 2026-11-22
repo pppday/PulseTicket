@@ -1,6 +1,6 @@
 from contextlib import asynccontextmanager
 import json
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -50,8 +50,9 @@ class RagSearchRequest(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    threadId: str = Field(..., min_length=1, max_length=128, description="多轮会话线程 ID（用于 SQLite Checkpointer 持久化）")
+    threadId: str = Field(..., min_length=1, max_length=128, description="多轮会话线程 ID（用于 PostgreSQL Checkpointer 持久化）")
     message: str = Field(..., min_length=1, max_length=2500, description="用户在对话框输入的自然语言消息")
+    mode: Literal["agent", "chat"] = Field("agent", description="对话模式：agent=任务执行与工具调用，chat=轻量只读咨询")
 
 
 class ConfirmRequest(BaseModel):
@@ -126,6 +127,7 @@ async def chat_endpoint(
             user_id=uid,
             username=uname,
             user_role=role,
+            mode=req.mode,
         )
         return {"code": 200, "data": data}
     except PermissionError as e:
@@ -152,6 +154,7 @@ async def chat_stream_endpoint(
                 user_id=uid,
                 username=uname,
                 user_role=role,
+                mode=req.mode,
             ):
                 yield _format_sse(item["event"], item["data"])
         except PermissionError as e:

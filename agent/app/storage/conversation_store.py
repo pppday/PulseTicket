@@ -155,10 +155,13 @@ class ConversationStore:
                     role TEXT NOT NULL,
                     content TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'COMPLETED',
+                    mode TEXT NOT NULL DEFAULT 'agent',
                     intents_json TEXT NOT NULL DEFAULT '[]',
                     subgraphs_json TEXT NOT NULL DEFAULT '[]',
                     citations_json TEXT NOT NULL DEFAULT '[]',
                     thinking_steps_json TEXT NOT NULL DEFAULT '[]',
+                    tool_cards_json TEXT NOT NULL DEFAULT '[]',
+                    widgets_json TEXT NOT NULL DEFAULT '[]',
                     confirmation_card_json TEXT,
                     card_decision TEXT,
                     latency_ms {flag_type} NOT NULL DEFAULT 0,
@@ -169,6 +172,30 @@ class ConversationStore:
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_msg_thread_id ON agent_message(thread_id, id ASC)"
             )
+            if self._use_postgres:
+                await conn.execute(
+                    "ALTER TABLE agent_message ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'agent'"
+                )
+                await conn.execute(
+                    "ALTER TABLE agent_message ADD COLUMN IF NOT EXISTS tool_cards_json TEXT NOT NULL DEFAULT '[]'"
+                )
+                await conn.execute(
+                    "ALTER TABLE agent_message ADD COLUMN IF NOT EXISTS widgets_json TEXT NOT NULL DEFAULT '[]'"
+                )
+            else:
+                cols = {r["name"] for r in await self._fetchall(conn, "PRAGMA table_info(agent_message)")}
+                if "mode" not in cols:
+                    await conn.execute(
+                        "ALTER TABLE agent_message ADD COLUMN mode TEXT NOT NULL DEFAULT 'agent'"
+                    )
+                if "tool_cards_json" not in cols:
+                    await conn.execute(
+                        "ALTER TABLE agent_message ADD COLUMN tool_cards_json TEXT NOT NULL DEFAULT '[]'"
+                    )
+                if "widgets_json" not in cols:
+                    await conn.execute(
+                        "ALTER TABLE agent_message ADD COLUMN widgets_json TEXT NOT NULL DEFAULT '[]'"
+                    )
             await self._commit_if_sqlite(conn)
         self._initialized = True
 
@@ -231,10 +258,13 @@ class ConversationStore:
         user_message: str,
         assistant_reply: str,
         status: str,
+        mode: str = "agent",
         intents: List[str],
         subgraphs: List[str],
         citations: List[str],
         thinking_steps: List[Dict[str, Any]],
+        tool_cards: Optional[List[Dict[str, Any]]] = None,
+        widgets: Optional[List[Dict[str, Any]]] = None,
         confirmation_card: Optional[Dict[str, Any]],
         latency_ms: int,
         record_user_msg: bool = True,
@@ -271,11 +301,14 @@ class ConversationStore:
 
             insert_msg_sql = """
                 INSERT INTO agent_message (
-                    thread_id, user_id, role, content, status,
+                    thread_id, user_id, role, content, status, mode,
                     intents_json, subgraphs_json, citations_json, thinking_steps_json,
+                    tool_cards_json, widgets_json,
                     confirmation_card_json, card_decision, latency_ms, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """
+
+            eff_mode = "chat" if str(mode or "").strip().lower() == "chat" else "agent"
 
             if record_user_msg and (user_message or "").strip():
                 await self._execute(
@@ -287,6 +320,9 @@ class ConversationStore:
                         "user",
                         (user_message or "").strip(),
                         "COMPLETED",
+                        eff_mode,
+                        "[]",
+                        "[]",
                         "[]",
                         "[]",
                         "[]",
@@ -311,10 +347,13 @@ class ConversationStore:
                     "assistant",
                     assistant_reply or "",
                     status or "COMPLETED",
+                    eff_mode,
                     json.dumps(intents or [], ensure_ascii=False),
                     json.dumps(subgraphs or [], ensure_ascii=False),
                     json.dumps(citations or [], ensure_ascii=False),
                     json.dumps(thinking_steps or [], ensure_ascii=False),
+                    json.dumps(tool_cards or [], ensure_ascii=False),
+                    json.dumps(widgets or [], ensure_ascii=False),
                     msg_card_json,
                     msg_card_decision,
                     max(0, int(latency_ms)),
@@ -483,10 +522,13 @@ class ConversationStore:
                 "role": r["role"],
                 "content": r["content"],
                 "status": r.get("status") or None,
+                "mode": r.get("mode") or "agent",
                 "intents": json.loads(r.get("intents_json") or "[]"),
                 "subgraphs": json.loads(r.get("subgraphs_json") or "[]"),
                 "citations": json.loads(r.get("citations_json") or "[]"),
                 "thinkingSteps": json.loads(r.get("thinking_steps_json") or "[]"),
+                "toolCards": json.loads(r.get("tool_cards_json") or "[]"),
+                "widgets": json.loads(r.get("widgets_json") or "[]"),
                 "thinkingExpanded": False,
                 "userToggledThinking": False,
                 "confirmationCard": card,

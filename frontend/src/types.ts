@@ -393,6 +393,8 @@ export interface OrderDbOverview {
 
 /* ---------------- AI Multi-Agent Chat & Observability Types ---------------- */
 
+export type AgentChatMode = 'agent' | 'chat'
+
 export interface AgentToolStep {
   agent?: string
   tool: string
@@ -408,6 +410,37 @@ export interface AgentThoughtStep {
   badges?: string[]
   status: 'running' | 'done' | 'warn'
   atMs: number
+}
+
+export interface AgentToolCard {
+  id: string
+  toolName: string
+  title: string
+  status: 'running' | 'done' | 'error'
+  summary?: string
+  input?: any
+  output?: any
+  atMs?: number
+  expanded?: boolean
+}
+
+export interface AgentWidgetOption {
+  id: string
+  label: string
+  badge?: string
+  meta?: string
+  price?: number
+  prompt: string
+}
+
+export interface AgentInteractiveWidget {
+  id: string
+  widgetType: 'SHOW_PICKER' | 'SEAT_PICKER' | 'ORDER_PICKER'
+  title: string
+  subtitle?: string
+  options: AgentWidgetOption[]
+  selectedOptionId?: string
+  selectedLabel?: string
 }
 
 export interface AgentConfirmationCard {
@@ -435,7 +468,9 @@ export interface AgentChatMessage {
   id: string
   role: 'user' | 'assistant'
   content: string
+  mode?: AgentChatMode
   streaming?: boolean
+  aborted?: boolean
   liveStepLabel?: string
   status?: 'COMPLETED' | 'INTERRUPTED' | 'BLOCKED' | 'ERROR'
   intents?: string[]
@@ -443,10 +478,14 @@ export interface AgentChatMessage {
   citations?: string[]
   toolSteps?: AgentToolStep[]
   thinkingSteps?: AgentThoughtStep[]
+  toolCards?: AgentToolCard[]
+  widgets?: AgentInteractiveWidget[]
   thinkingExpanded?: boolean
   userToggledThinking?: boolean
   confirmationCard?: AgentConfirmationCard | null
   cardDecision?: 'PENDING' | 'SUBMITTING' | 'CONFIRMED' | 'REJECTED' | 'EXPIRED'
+  feedback?: 'up' | 'down' | null
+  copied?: boolean
   latencyMs?: number
   createdAt?: string
 }

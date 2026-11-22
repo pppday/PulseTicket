@@ -23,8 +23,8 @@ fi
 # 1C2G 专属极限 JVM 参数：
 # - UseSerialGC: 单核 CPU 零 GC 线程争抢，省去 G1 RememberedSet 内存开销
 # - TieredStopAtLevel=1: 仅使用 C1 即时编译器，省去 40MB+ CodeCache 且防止多个 JVM 抢占单核 CPU 导致假死
-# - MaxMetaspaceSize=96m + Xshare:auto: 限制元空间上限并开启 CDS 共享底层只读内存页
-JVM_OPTS="-Xms48m -Xmx112m -Xss256k -XX:ReservedCodeCacheSize=24m -XX:MaxMetaspaceSize=96m -XX:+UseSerialGC -XX:TieredStopAtLevel=1 -Xshare:auto -Djava.security.egd=file:/dev/./urandom -Dspring.jmx.enabled=false"
+# - MaxMetaspaceSize=144m + ExitOnOutOfMemoryError + Xshare:auto: 放宽元空间上限避免 Spring Cloud 类元数据 OOM，并启用 OOM 快速退出防假活
+JVM_OPTS="-Xms48m -Xmx112m -Xss256k -XX:ReservedCodeCacheSize=24m -XX:MaxMetaspaceSize=144m -XX:+ExitOnOutOfMemoryError -XX:+UseSerialGC -XX:TieredStopAtLevel=1 -Xshare:auto -Djava.security.egd=file:/dev/./urandom -Dspring.jmx.enabled=false"
 SPRING_SLIM_ARGS="--server.tomcat.threads.max=20 --server.tomcat.threads.min-spare=2 --spring.datasource.hikari.maximum-pool-size=5 --spring.datasource.hikari.minimum-idle=1"
 
 echo "===================================================="
