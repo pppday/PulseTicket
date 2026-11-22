@@ -446,8 +446,37 @@ export interface AgentChatMessage {
   thinkingExpanded?: boolean
   userToggledThinking?: boolean
   confirmationCard?: AgentConfirmationCard | null
-  cardDecision?: 'PENDING' | 'SUBMITTING' | 'CONFIRMED' | 'REJECTED'
+  cardDecision?: 'PENDING' | 'SUBMITTING' | 'CONFIRMED' | 'REJECTED' | 'EXPIRED'
   latencyMs?: number
+  createdAt?: string
+}
+
+export interface AgentThreadSummary {
+  threadId: string
+  title: string
+  lastPreview: string
+  status: 'ACTIVE' | 'INTERRUPTED'
+  hasPendingCard: boolean
+  messageCount: number
+  createdAt: string
+  updatedAt: string
+  expiresAt: string
+}
+
+export interface AgentThreadsListPayload {
+  threads: AgentThreadSummary[]
+  ttlDays: number
+}
+
+export interface AgentThreadDetailPayload {
+  threadId: string
+  title: string
+  status: 'ACTIVE' | 'INTERRUPTED'
+  pendingCard: AgentConfirmationCard | null
+  pendingCardExpired: boolean
+  expiresAt: string
+  updatedAt: string
+  messages: AgentChatMessage[]
 }
 
 export interface AgentTraceItem {

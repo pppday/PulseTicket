@@ -7,8 +7,8 @@
 ## 一、RabbitMQ 延迟关单（TTL + 死信交换机 DLX）与队头阻塞解法
 
 ### 1. 代码链路定位
-- 配置与消费者：[OrderMqConfigAndListener.java](file:///c:/Users/lan/Desktop/项目/pulseticket/order-service/src/main/java/com/pulseticket/order/mq/OrderMqConfigAndListener.java)
-- 座位释放消费者：[ShowMqConfigAndListener.java](file:///c:/Users/lan/Desktop/项目/pulseticket/show-service/src/main/java/com/pulseticket/show/mq/ShowMqConfigAndListener.java)
+- 配置与消费者：[OrderMqConfigAndListener.java](file:///c:/Users/lan/Desktop/项目/pulseticket/backend/order-service/src/main/java/com/pulseticket/order/mq/OrderMqConfigAndListener.java)
+- 座位释放消费者：[ShowMqConfigAndListener.java](file:///c:/Users/lan/Desktop/项目/pulseticket/backend/show-service/src/main/java/com/pulseticket/show/mq/ShowMqConfigAndListener.java)
 
 ### 2. 为什么我们声明了 `15m` 和 `fast (15s)` 两个独立的死信缓冲队列？
 - **面试经典坑点（队头阻塞 Head-of-Line Blocking）**：RabbitMQ 的普通队列只会检查**队首第一条消息**是否过期。如果把 15 分钟的标准订单和 15 秒的极速闪购/演示订单混塞进同一个队列，排在后面的 15 秒消息会被前面的 15 分钟消息死死堵住出不来！
@@ -19,7 +19,7 @@
 ## 二、14:59 付款与 15:00 关单并发撞车怎么防？
 
 - **场景**：用户在倒计时最后 1 秒完成支付，同时死信队列的超时关单消息也投递到了消费者。
-- **解法（状态机 CAS 原子互斥）**：查看 [TicketOrderMapper.java](file:///c:/Users/lan/Desktop/项目/pulseticket/order-service/src/main/java/com/pulseticket/order/mapper/TicketOrderMapper.java)：
+- **解法（状态机 CAS 原子互斥）**：查看 [TicketOrderMapper.java](file:///c:/Users/lan/Desktop/项目/pulseticket/backend/order-service/src/main/java/com/pulseticket/order/mapper/TicketOrderMapper.java)：
   - 支付 SQL：`UPDATE ticket_order SET status = 'PAID', version = version + 1 WHERE order_no = ? AND status = 'UNPAID'`
   - 关单 SQL：`UPDATE ticket_order SET status = 'CLOSED', version = version + 1 WHERE order_no = ? AND status = 'UNPAID'`
   - 两条 SQL 在 MySQL 行锁下严格串行，谁先抢到谁将 `status` 改掉，后到者的 `WHERE status = 'UNPAID'` 匹配行数为 `0`，自动走幂等跳过分支，绝不会发生“收了钱却把单关了”的事故！
@@ -28,15 +28,15 @@
 
 ## 三、支付成功 Fanout 异步解耦与数据库唯一索引消费幂等
 
-- 当用户点击支付成功后，[OrderFacade.java](file:///c:/Users/lan/Desktop/项目/pulseticket/order-service/src/main/java/com/pulseticket/order/service/OrderFacade.java) 向 `ticket.order.paid.fanout` 广播一条 `OrderPaidEventDTO`：
+- 当用户点击支付成功后，[OrderFacade.java](file:///c:/Users/lan/Desktop/项目/pulseticket/backend/order-service/src/main/java/com/pulseticket/order/service/OrderFacade.java) 向 `ticket.order.paid.fanout` 广播一条 `OrderPaidEventDTO`：
   1. **`show-service` 监听队列 `ticket.show.paid.queue`**：执行 `WHERE locked_order_no = ? AND status = 'LOCKED'` 将座位改为 `SOLD` 并删除 Redis 座位缓存；
-  2. **`user-service` 监听队列 `ticket.user.paid.queue`**：在 [UserPointsService.java](file:///c:/Users/lan/Desktop/项目/pulseticket/user-service/src/main/java/com/pulseticket/user/service/UserPointsService.java) 中先向 `points_log` 插入积分流水。由于表中建有 **`UNIQUE KEY uk_order_biz (order_no, biz_type)`**，即使 RabbitMQ 网络抖动重复投递了 5 次相同消息，后续 4 次都会触发 `DuplicateKeyException` 被捕获并直接回传 `basicAck`，保证**积分绝不翻倍发放**！
+  2. **`user-service` 监听队列 `ticket.user.paid.queue`**：在 [UserPointsService.java](file:///c:/Users/lan/Desktop/项目/pulseticket/backend/user-service/src/main/java/com/pulseticket/user/service/UserPointsService.java) 中先向 `points_log` 插入积分流水。由于表中建有 **`UNIQUE KEY uk_order_biz (order_no, biz_type)`**，即使 RabbitMQ 网络抖动重复投递了 5 次相同消息，后续 4 次都会触发 `DuplicateKeyException` 被捕获并直接回传 `basicAck`，保证**积分绝不翻倍发放**！
 
 ---
 
 ## 四、Redis 热点演出详情缓存「三座大山」防护
 
-- 源码位置：[ShowCacheAndSeatService.java](file:///c:/Users/lan/Desktop/项目/pulseticket/show-service/src/main/java/com/pulseticket/show/service/ShowCacheAndSeatService.java)
+- 源码位置：[ShowCacheAndSeatService.java](file:///c:/Users/lan/Desktop/项目/pulseticket/backend/show-service/src/main/java/com/pulseticket/show/service/ShowCacheAndSeatService.java)
   1. **防缓存穿透**：查询不存在的 `showId`（如 `99999`）时，向 Redis 写入 `"__NULL__"` 哨兵值（TTL `60s`），拦截恶意不存在 ID 攻击；
   2. **防缓存击穿**：缓存未命中时使用 Redisson `RLock` (`lock:cache:show:rebuild:{showId}`) + **Double-Check 双重检查**，只放 1 个线程查 MySQL 重建缓存；
   3. **防缓存雪崩**：过期时间设为 `1800s + random(60~360s)` 随机抖动值；

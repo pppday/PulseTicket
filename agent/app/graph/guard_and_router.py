@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
+from app.config import settings
 from app.graph.state import MainGraphState, SharedSlots, get_chat_llm
 from app.graph.thought_stream import emit_thought
 
@@ -97,31 +98,33 @@ def detect_prompt_injection(text: str) -> Optional[str]:
 def summarize_and_trim_history(
     messages: List[BaseMessage],
     existing_summary: str = "",
-    keep_recent: int = 8,
+    keep_recent: Optional[int] = None,
 ) -> Tuple[str, List[BaseMessage]]:
     """
-    【P1 对话历史滑动窗口与摘要折叠】：
-    保留最近 keep_recent 条对话消息原样传给子图，将更早的历史折叠为精简摘要（<= 600 字），
-    防止多轮对话上下文无限膨胀。
+    【对话上下文 3 轮滑动窗口裁剪】：
+    只取最近 LLM_CONTEXT_MAX_TURNS 轮（默认 3 轮 = 6 条历史消息，不含当前最新提问），
+    废弃 600 字滚动摘要累加防止 Context Rot；单条消息（尤其是助手长回复）截断到上限字符数，
+    跨轮指代主要交给 SharedSlots 结构化槽位透传。
     """
-    chat_msgs = [m for m in (messages or []) if isinstance(m, (HumanMessage, AIMessage)) and str(m.content or "").strip()]
-    if len(chat_msgs) <= keep_recent:
-        return existing_summary, chat_msgs
+    chat_msgs = [
+        m
+        for m in (messages or [])
+        if isinstance(m, (HumanMessage, AIMessage)) and str(m.content or "").strip()
+    ]
+    prior_msgs = chat_msgs[:-1] if (chat_msgs and isinstance(chat_msgs[-1], HumanMessage)) else chat_msgs
+    window_size = keep_recent if keep_recent is not None else max(2, settings.LLM_CONTEXT_MAX_TURNS * 2)
+    recent_prior = prior_msgs[-window_size:] if window_size > 0 else []
 
-    older = chat_msgs[:-keep_recent]
-    recent = chat_msgs[-keep_recent:]
-    snippets: List[str] = []
-    if existing_summary:
-        snippets.append(existing_summary.strip())
-    for m in older[-6:]:
+    max_chars = max(50, settings.LLM_CONTEXT_ASSISTANT_MAX_CHARS)
+    lines: List[str] = []
+    for m in recent_prior:
         role = "用户" if isinstance(m, HumanMessage) else "助手"
-        txt = re.sub(r"\s+", " ", str(m.content)).strip()[:70]
-        snippets.append(f"{role}: {txt}")
+        txt = re.sub(r"\s+", " ", str(m.content)).strip()
+        if len(txt) > max_chars:
+            txt = txt[:max_chars] + "…"
+        lines.append(f"{role}: {txt}")
 
-    merged = " | ".join(snippets)
-    if len(merged) > 600:
-        merged = merged[-600:]
-    return merged, recent
+    return "\n".join(lines), recent_prior
 
 
 def extract_deterministic_signals(query: str, prev_slots: Optional[SharedSlots] = None) -> Tuple[List[str], SharedSlots]:
@@ -301,9 +304,16 @@ async def intent_router_node(state: MainGraphState) -> Dict[str, Any]:
     try:
         llm = get_chat_llm(temperature=0.0)
         slot_ctx = json.dumps(merged_slots, ensure_ascii=False)
+        recent_ctx = (state.get("history_summary") or "").strip() or "无"
         resp = await llm.ainvoke([
             SystemMessage(content=ROUTER_SYSTEM_PROMPT),
-            HumanMessage(content=f"【已有上下文槽位】: {slot_ctx}\n【用户最新输入】: {query}"),
+            HumanMessage(
+                content=(
+                    f"【最近 {settings.LLM_CONTEXT_MAX_TURNS} 轮对话】:\n{recent_ctx}\n"
+                    f"【已有上下文槽位】: {slot_ctx}\n"
+                    f"【用户最新输入】: {query}"
+                )
+            ),
         ])
         parsed = _extract_json_obj(str(resp.content or ""))
         if parsed and isinstance(parsed.get("intents"), list):

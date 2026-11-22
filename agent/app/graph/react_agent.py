@@ -403,27 +403,64 @@ def _extract_interrupt_card(snapshot: Any) -> Optional[Dict[str, Any]]:
 
 
 class TicketAgentManager:
-    """管理 SQLite 持久化 Checkpointer 与 LangGraph 会话执行"""
+    """管理持久化 Checkpointer (PostgreSQL 16 优先，无 PG DSN 时降级 SQLite) 与 LangGraph 会话执行"""
 
-    def __init__(self, db_path: str = settings.CHECKPOINT_DB_PATH):
-        self.db_path = db_path
+    def __init__(self, db_path: Optional[str] = None, postgres_dsn: Optional[str] = None):
+        if db_path is not None:
+            self._use_postgres = False
+            self.db_path = db_path
+            self.postgres_dsn = ""
+        else:
+            dsn = (postgres_dsn if postgres_dsn is not None else settings.CHECKPOINT_POSTGRES_DSN).strip()
+            if dsn:
+                self._use_postgres = True
+                self.postgres_dsn = dsn
+                self.db_path = ""
+            else:
+                self._use_postgres = False
+                self.postgres_dsn = ""
+                self.db_path = settings.CHECKPOINT_DB_PATH
+        self._pg_pool: Any = None
         self._conn: Optional[aiosqlite.Connection] = None
-        self._checkpointer: Optional[AsyncSqliteSaver] = None
+        self._checkpointer: Any = None
         self.graph = None
 
+    @property
+    def checkpoint_backend(self) -> str:
+        return "postgresql-async" if self._use_postgres else "sqlite-fallback"
+
     async def startup(self):
-        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = await aiosqlite.connect(self.db_path)
-        self._checkpointer = AsyncSqliteSaver(self._conn)
-        await self._checkpointer.setup()
+        if self._use_postgres:
+            from psycopg.rows import dict_row
+            from psycopg_pool import AsyncConnectionPool
+            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+            self._pg_pool = AsyncConnectionPool(
+                conninfo=self.postgres_dsn,
+                min_size=1,
+                max_size=5,
+                open=False,
+                kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
+            )
+            await self._pg_pool.open()
+            self._checkpointer = AsyncPostgresSaver(self._pg_pool)
+            await self._checkpointer.setup()
+        else:
+            Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+            self._conn = await aiosqlite.connect(self.db_path)
+            self._checkpointer = AsyncSqliteSaver(self._conn)
+            await self._checkpointer.setup()
         self.graph = build_ticket_react_graph().compile(checkpointer=self._checkpointer)
 
     async def shutdown(self):
+        if self._pg_pool is not None:
+            await self._pg_pool.close()
+            self._pg_pool = None
         if self._conn is not None:
             await self._conn.close()
             self._conn = None
-            self._checkpointer = None
-            self.graph = None
+        self._checkpointer = None
+        self.graph = None
 
     @staticmethod
     def _validate_user(user_id: int, username: str, user_role: str = "USER") -> Dict[str, Any]:

@@ -11,6 +11,7 @@ from app.config import settings
 from app.graph.main_graph import multi_agent_manager as ticket_agent_manager
 from app.observability.tracer import agent_tracer
 from app.rag.hybrid_rag import hybrid_rag_engine
+from app.storage.conversation_store import conversation_store
 
 
 @asynccontextmanager
@@ -19,7 +20,9 @@ async def lifespan(app: FastAPI):
     await ticket_agent_manager.startup()
     print(
         f"[PulseTicket Agent v2] 主 Graph + 3 子图已就绪 | "
-        f"知识分片={chunk_count} | DEV_MOCK={settings.DEV_MOCK}"
+        f"知识分片={chunk_count} | DEV_MOCK={settings.DEV_MOCK} | "
+        f"checkpointer={ticket_agent_manager.checkpoint_backend} | tracer={agent_tracer.backend_name} | "
+        f"conversations={getattr(ticket_agent_manager, 'conv_store', conversation_store).backend_name}"
     )
     yield
     await ticket_agent_manager.shutdown()
@@ -86,17 +89,24 @@ async def health():
         "port": settings.AGENT_PORT,
         "llmModel": settings.LLM_MODEL,
         "devMock": settings.DEV_MOCK,
+        "checkpointBackend": ticket_agent_manager.checkpoint_backend,
+        "traceBackend": agent_tracer.backend_name,
+        "conversationBackend": getattr(ticket_agent_manager, "conv_store", conversation_store).backend_name,
+        "conversationTtlDays": settings.CONVERSATION_TTL_DAYS,
+        "contextMaxTurns": settings.LLM_CONTEXT_MAX_TURNS,
         "indexedKnowledgeChunks": len(hybrid_rag_engine._chunks),
+        "ragBackend": hybrid_rag_engine.backend_info,
     }
 
 
 @app.post("/api/agent/rag/search")
 async def test_hybrid_rag(req: RagSearchRequest):
-    """单独测试 Hybrid RAG (jieba BM25 + 512d 稠密向量 + RRF 重排) 的检索明细与打分"""
+    """单独测试 Hybrid RAG (jieba BM25 + bge-m3/pgvector + RRF + Cross-Encoder Rerank) 的检索明细与打分"""
     hits = await hybrid_rag_engine.search(req.query, top_k=req.top_k)
     return {
         "code": 200,
         "query": req.query,
+        "backend": hybrid_rag_engine.backend_info,
         "hits": hits,
     }
 
@@ -233,6 +243,59 @@ async def get_agent_traces(
         raise HTTPException(status_code=403, detail="仅限架构运维专员 (ADMIN) 查看 Agent 编排审计轨迹")
     data = await agent_tracer.list_recent_traces(limit=limit)
     return {"code": 200, "data": data}
+
+
+@app.get("/api/agent/threads")
+async def list_agent_threads(
+    limit: int = Query(default=30, ge=1, le=30),
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+    x_username: Optional[str] = Header(default=None, alias="X-Username"),
+    x_user_role: Optional[str] = Header(default=None, alias="X-User-Role"),
+):
+    """查询当前登录用户的 7 天内历史会话列表（按最近活跃倒序，最多 30 条）"""
+    uid, _, _ = _require_auth_headers(x_user_id, x_username, x_user_role)
+    threads = await ticket_agent_manager.list_threads(user_id=uid, limit=limit)
+    return {
+        "code": 200,
+        "data": {
+            "threads": threads,
+            "ttlDays": settings.CONVERSATION_TTL_DAYS,
+        },
+    }
+
+
+@app.get("/api/agent/threads/{thread_id}")
+async def get_agent_thread_detail(
+    thread_id: str,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+    x_username: Optional[str] = Header(default=None, alias="X-Username"),
+    x_user_role: Optional[str] = Header(default=None, alias="X-User-Role"),
+):
+    """获取单条历史会话的展示消息、思考链轨迹与 15 分钟内有效的待确认卡片"""
+    uid, _, _ = _require_auth_headers(x_user_id, x_username, x_user_role)
+    try:
+        detail = await ticket_agent_manager.get_thread_detail(thread_id=thread_id, user_id=uid)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    if detail is None:
+        raise HTTPException(status_code=404, detail="对话不存在或已超过 7 天保留期")
+    return {"code": 200, "data": detail}
+
+
+@app.delete("/api/agent/threads/{thread_id}")
+async def delete_agent_thread(
+    thread_id: str,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+    x_username: Optional[str] = Header(default=None, alias="X-Username"),
+    x_user_role: Optional[str] = Header(default=None, alias="X-User-Role"),
+):
+    """删除个人历史会话，同时联动清理展示历史与 LangGraph Checkpoint 状态"""
+    uid, _, _ = _require_auth_headers(x_user_id, x_username, x_user_role)
+    try:
+        deleted = await ticket_agent_manager.delete_thread(thread_id=thread_id, user_id=uid)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    return {"code": 200, "data": {"threadId": thread_id, "deleted": deleted}}
 
 
 if __name__ == "__main__":

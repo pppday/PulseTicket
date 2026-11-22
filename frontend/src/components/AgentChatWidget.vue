@@ -1,23 +1,37 @@
 <script setup lang="ts">
-import { nextTick, ref } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import {
   ArrowUp,
   Check,
   ChevronDown,
+  Clock,
+  History,
   Maximize2,
   Minimize2,
+  Plus,
   RotateCcw,
   ShieldCheck,
   Sparkles,
+  Trash2,
   X
 } from 'lucide-vue-next'
-import { getToken } from '../api'
+import { api, getToken } from '../api'
 import { refreshAll, state, toast } from '../store'
-import type { AgentChatMessage, AgentConfirmationCard, AgentThoughtStep } from '../types'
+import type {
+  AgentChatMessage,
+  AgentConfirmationCard,
+  AgentThreadDetailPayload,
+  AgentThreadSummary,
+  AgentThreadsListPayload,
+  AgentThoughtStep
+} from '../types'
 import { money } from '../utils'
 
 const isOpen = ref(false)
 const isWide = ref(false)
+const historyOpen = ref(false)
+const loadingThreads = ref(false)
+const loadingThreadDetail = ref(false)
 const inputText = ref('')
 const sending = ref(false)
 const scrollBox = ref<HTMLElement | null>(null)
@@ -26,8 +40,129 @@ function makeThreadId() {
   return `web-${state.user?.id || 'u'}-${Date.now().toString(36)}`
 }
 
+function threadStorageKey(uid?: number | null): string {
+  return uid ? `pulseticket_agent_thread_${uid}` : ''
+}
+
+function saveActiveThreadId(tid: string) {
+  const key = threadStorageKey(state.user?.id)
+  if (!key) return
+  try {
+    if (tid) {
+      localStorage.setItem(key, tid)
+    } else {
+      localStorage.removeItem(key)
+    }
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function readSavedThreadId(uid?: number | null): string {
+  const key = threadStorageKey(uid)
+  if (!key) return ''
+  try {
+    return localStorage.getItem(key) || ''
+  } catch {
+    return ''
+  }
+}
+
 const threadId = ref(makeThreadId())
 const messages = ref<AgentChatMessage[]>([])
+const threads = ref<AgentThreadSummary[]>([])
+
+const groupedThreads = computed(() => {
+  const now = new Date()
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
+  const yesterdayStart = todayStart - 86400 * 1000
+  const groups: { label: string; items: AgentThreadSummary[] }[] = [
+    { label: '今天', items: [] },
+    { label: '昨天', items: [] },
+    { label: '近 7 天', items: [] }
+  ]
+  for (const item of threads.value) {
+    const ts = Date.parse(item.updatedAt || '')
+    if (!Number.isFinite(ts) || ts >= todayStart) {
+      groups[0].items.push(item)
+    } else if (ts >= yesterdayStart) {
+      groups[1].items.push(item)
+    } else {
+      groups[2].items.push(item)
+    }
+  }
+  return groups.filter(g => g.items.length > 0)
+})
+
+function formatRelativeTime(iso?: string): string {
+  if (!iso) return ''
+  const dt = new Date(iso)
+  if (Number.isNaN(dt.getTime())) return ''
+  const now = new Date()
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
+  const ts = dt.getTime()
+  const hh = String(dt.getHours()).padStart(2, '0')
+  const mm = String(dt.getMinutes()).padStart(2, '0')
+  if (ts >= todayStart) return `${hh}:${mm}`
+  if (ts >= todayStart - 86400 * 1000) return `昨天 ${hh}:${mm}`
+  return `${dt.getMonth() + 1}/${dt.getDate()}`
+}
+
+async function loadThreads() {
+  if (!state.user?.id || !getToken()) return
+  loadingThreads.value = true
+  try {
+    const res = await api<AgentThreadsListPayload>('/api/agent/threads?limit=30')
+    if (res.code === 200 && res.data?.threads) {
+      threads.value = res.data.threads
+    }
+  } finally {
+    loadingThreads.value = false
+  }
+}
+
+async function selectThread(targetThreadId: string, closeDrawer = true) {
+  if (!targetThreadId || sending.value) return
+  loadingThreadDetail.value = true
+  try {
+    const res = await api<AgentThreadDetailPayload>(
+      `/api/agent/threads/${encodeURIComponent(targetThreadId)}`
+    )
+    if (res.code === 200 && res.data) {
+      threadId.value = res.data.threadId
+      messages.value = res.data.messages || []
+      saveActiveThreadId(res.data.threadId)
+      if (closeDrawer) {
+        historyOpen.value = false
+      }
+      if (res.data.pendingCardExpired) {
+        toast('info', '历史确认卡片已超时失效', '该笔报价已超过 15 分钟有效期，如需下单请重新选座核价')
+      }
+      scrollToBottom()
+    } else if (readSavedThreadId(state.user?.id) === targetThreadId) {
+      saveActiveThreadId('')
+    }
+  } finally {
+    loadingThreadDetail.value = false
+  }
+}
+
+async function deleteThread(targetThreadId: string) {
+  if (!targetThreadId || sending.value) return
+  const res = await api<{ threadId: string; deleted: boolean }>(
+    `/api/agent/threads/${encodeURIComponent(targetThreadId)}`,
+    { method: 'DELETE' }
+  )
+  if (res.code === 200) {
+    threads.value = threads.value.filter(t => t.threadId !== targetThreadId)
+    if (threadId.value === targetThreadId) {
+      startNewConversation()
+    }
+    toast('success', '已删除该历史对话', '服务端会话与检查点断点已同步清理')
+  } else {
+    toast('error', '删除失败', res.message || '请稍后重试')
+  }
+}
 
 const quickPrompts = [
   {
@@ -56,11 +191,42 @@ function scrollToBottom() {
   })
 }
 
-function resetConversation() {
+function startNewConversation() {
   if (sending.value) return
   threadId.value = makeThreadId()
   messages.value = []
+  saveActiveThreadId('')
+  historyOpen.value = false
 }
+
+watch(
+  () => state.user?.id,
+  async uid => {
+    if (!uid) {
+      threads.value = []
+      messages.value = []
+      historyOpen.value = false
+      threadId.value = makeThreadId()
+      return
+    }
+    await loadThreads()
+    const saved = readSavedThreadId(uid)
+    if (saved && threads.value.some(t => t.threadId === saved)) {
+      await selectThread(saved, false)
+    } else {
+      if (saved) saveActiveThreadId('')
+      threadId.value = makeThreadId()
+      messages.value = []
+    }
+  },
+  { immediate: true }
+)
+
+watch(isOpen, open => {
+  if (open && state.user?.id) {
+    loadThreads()
+  }
+})
 
 function toggleThinking(msg: AgentChatMessage) {
   msg.thinkingExpanded = !msg.thinkingExpanded
@@ -404,6 +570,8 @@ async function sendMessage(preset?: string) {
       { threadId: threadId.value, message: text },
       reactiveAssistant
     )
+    saveActiveThreadId(threadId.value)
+    await loadThreads()
   } catch (err: any) {
     reactiveAssistant.status = 'ERROR'
     reactiveAssistant.content =
@@ -445,6 +613,8 @@ async function handleCardDecision(msg: AgentChatMessage, confirmed: boolean) {
       reactiveReceipt
     )
     msg.cardDecision = confirmed ? 'CONFIRMED' : 'REJECTED'
+    saveActiveThreadId(threadId.value)
+    await loadThreads()
 
     if (confirmed) {
       await refreshAll()
@@ -488,7 +658,7 @@ async function handleCardDecision(msg: AgentChatMessage, confirmed: boolean) {
     >
       <section
         v-if="isOpen"
-        class="mb-3 flex flex-col overflow-hidden rounded-[28px] border border-[#E5E1DA] bg-[#FCFBF9] shadow-[0_24px_64px_-16px_rgba(26,25,23,0.24),0_2px_8px_rgba(26,25,23,0.05)] transition-all duration-300 ease-out"
+        class="relative mb-3 flex flex-col overflow-hidden rounded-[28px] border border-[#E5E1DA] bg-[#FCFBF9] shadow-[0_24px_64px_-16px_rgba(26,25,23,0.24),0_2px_8px_rgba(26,25,23,0.05)] transition-all duration-300 ease-out"
         :class="
           isWide
             ? 'h-[760px] max-h-[calc(100vh-96px)] w-[660px] max-w-[calc(100vw-32px)]'
@@ -513,12 +683,27 @@ async function handleCardDecision(msg: AgentChatMessage, confirmed: boolean) {
                 </span>
               </div>
               <p class="mt-0.5 text-[11px] text-ink-mute">
-                {{ sending ? '正在深度思考与调度子图…' : '主图意图路由 · Hybrid RAG · 权威核价门控' }}
+                {{ sending ? '正在深度思考与调度子图…' : '主图意图路由 · 3轮轻量记忆 · 7天历史恢复' }}
               </p>
             </div>
           </div>
 
           <div class="flex items-center gap-1">
+            <button
+              type="button"
+              class="relative grid h-8 w-8 place-items-center rounded-full text-ink-mute transition hover:bg-white hover:text-ink"
+              :class="historyOpen ? 'bg-white text-ink shadow-sm' : ''"
+              title="最近 7 天对话"
+              @click="historyOpen = !historyOpen"
+            >
+              <History class="h-3.5 w-3.5" />
+              <span
+                v-if="threads.length"
+                class="absolute -right-0.5 -top-0.5 flex h-3.5 min-w-[14px] items-center justify-center rounded-full bg-gold px-1 font-mono text-[9px] font-semibold text-white"
+              >
+                {{ threads.length }}
+              </span>
+            </button>
             <button
               class="hidden h-8 w-8 place-items-center rounded-full text-ink-mute transition hover:bg-white hover:text-ink sm:grid"
               :title="isWide ? '切换紧凑视图' : '切换宽屏阅读视图'"
@@ -531,7 +716,7 @@ async function handleCardDecision(msg: AgentChatMessage, confirmed: boolean) {
               class="grid h-8 w-8 place-items-center rounded-full text-ink-mute transition hover:bg-white hover:text-ink disabled:opacity-35"
               title="开启新对话"
               :disabled="sending"
-              @click="resetConversation"
+              @click="startNewConversation"
             >
               <RotateCcw class="h-3.5 w-3.5" />
             </button>
@@ -545,10 +730,108 @@ async function handleCardDecision(msg: AgentChatMessage, confirmed: boolean) {
           </div>
         </header>
 
+        <!-- 7-Day Sliding History Drawer Overlay -->
+        <Transition
+          enter-active-class="transition duration-200 ease-out"
+          enter-from-class="opacity-0 -translate-x-3"
+          leave-active-class="transition duration-150 ease-in"
+          leave-to-class="opacity-0 -translate-x-3"
+        >
+          <div
+            v-if="historyOpen"
+            class="absolute inset-x-0 bottom-0 top-[73px] z-20 flex bg-ink/20 backdrop-blur-[1px]"
+            @click.self="historyOpen = false"
+          >
+            <aside class="flex h-full w-[276px] max-w-[84%] flex-col border-r border-line bg-[#FAF8F4] shadow-xl">
+              <div class="flex items-center justify-between border-b border-line px-4 py-3">
+                <div>
+                  <p class="text-xs font-semibold text-ink">最近 7 天对话</p>
+                  <p class="text-[10.5px] text-ink-mute">活跃自动顺延 · 模型仅读近 3 轮</p>
+                </div>
+                <button
+                  type="button"
+                  class="inline-flex items-center gap-1 rounded-lg border border-line bg-white px-2.5 py-1 text-[11px] font-medium text-ink transition hover:border-ink/30 hover:bg-paper disabled:opacity-40"
+                  :disabled="sending"
+                  @click="startNewConversation"
+                >
+                  <Plus class="h-3 w-3" />
+                  <span>新对话</span>
+                </button>
+              </div>
+
+              <div class="flex-1 space-y-4 overflow-y-auto px-3 py-3">
+                <div v-if="loadingThreads && !threads.length" class="py-8 text-center text-xs text-ink-mute">
+                  正在加载历史对话…
+                </div>
+                <div
+                  v-else-if="!threads.length"
+                  class="rounded-xl border border-dashed border-line bg-white/70 px-3 py-6 text-center text-xs text-ink-mute"
+                >
+                  近 7 天暂无保存的对话记录
+                </div>
+
+                <div v-for="group in groupedThreads" :key="group.label" class="space-y-1.5">
+                  <p class="px-1.5 font-mono text-[10px] font-medium uppercase tracking-wider text-ink-mute">
+                    {{ group.label }}
+                  </p>
+                  <div
+                    v-for="item in group.items"
+                    :key="item.threadId"
+                    role="button"
+                    tabindex="0"
+                    class="group relative flex cursor-pointer items-start justify-between gap-2 rounded-xl border px-3 py-2.5 transition"
+                    :class="
+                      item.threadId === threadId
+                        ? 'border-ink/30 bg-white shadow-sm'
+                        : 'border-transparent bg-white/60 hover:border-line hover:bg-white'
+                    "
+                    @click="selectThread(item.threadId)"
+                  >
+                    <div class="min-w-0 flex-1">
+                      <div class="flex items-center gap-1.5">
+                        <span class="truncate text-xs font-medium text-ink">
+                          {{ item.title }}
+                        </span>
+                        <span
+                          v-if="item.hasPendingCard"
+                          class="shrink-0 rounded bg-gold-soft px-1.5 py-0.5 text-[9.5px] font-medium text-gold"
+                        >
+                          待确认
+                        </span>
+                      </div>
+                      <p class="mt-0.5 truncate text-[11px] text-ink-soft">
+                        {{ item.lastPreview || '点击恢复对话' }}
+                      </p>
+                      <p class="mt-1 font-mono text-[10px] text-ink-mute">
+                        {{ formatRelativeTime(item.updatedAt) }} · {{ item.messageCount }} 条
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      class="shrink-0 rounded-lg p-1 text-ink-mute opacity-70 transition hover:bg-brick-soft/50 hover:text-brick group-hover:opacity-100 disabled:opacity-30"
+                      title="删除该会话"
+                      :disabled="sending"
+                      @click.stop="deleteThread(item.threadId)"
+                    >
+                      <Trash2 class="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </aside>
+          </div>
+        </Transition>
+
         <!-- Conversation Canvas -->
         <div ref="scrollBox" class="flex-1 space-y-5 overflow-y-auto px-5 py-5">
+          <div
+            v-if="loadingThreadDetail && !messages.length"
+            class="rounded-2xl border border-line bg-white px-4 py-6 text-center text-xs text-ink-mute"
+          >
+            正在恢复历史对话与思考链轨迹…
+          </div>
           <!-- Curated Empty State -->
-          <div v-if="!messages.length" class="space-y-5 py-1">
+          <div v-else-if="!messages.length" class="space-y-5 py-1">
             <div class="rounded-2xl border border-line/90 bg-white p-4 shadow-[0_1px_3px_rgba(26,25,23,0.02)]">
               <p class="eyebrow">Concierge Architecture</p>
               <p class="mt-2 text-[13px] font-medium leading-snug text-ink">
@@ -797,6 +1080,14 @@ async function handleCardDecision(msg: AgentChatMessage, confirmed: boolean) {
                     class="mt-3 rounded-xl bg-paper py-2 text-center text-[11px] text-ink-mute"
                   >
                     正在携带幂等键向 Java 订单服务提交…
+                  </div>
+
+                  <div
+                    v-else-if="msg.cardDecision === 'EXPIRED'"
+                    class="mt-3 flex items-center justify-center gap-1.5 rounded-xl bg-paper py-2 text-[11px] font-medium text-ink-mute"
+                  >
+                    <Clock class="h-3.5 w-3.5" />
+                    <span>报价已超过 15 分钟失效，请重新选座核价</span>
                   </div>
 
                   <div

@@ -93,15 +93,23 @@ async def query_rewrite_node(state: KnowledgeSubState) -> Dict[str, Any]:
 
 
 async def hybrid_retrieve_node(state: KnowledgeSubState) -> Dict[str, Any]:
-    """【子图节点 2：hybrid_retrieve】执行 jieba BM25 + 512d 稠密向量 + RRF 混合检索。"""
+    """【子图节点 2：hybrid_retrieve】执行 jieba BM25 + bge-m3/pgvector + RRF + Cross-Encoder Rerank 混合检索（无 Key 时降级 BM25-only）。"""
     rq = state.get("rewritten_query") or state.get("query") or ""
     retry = int(state.get("retry_count") or 0)
+    binfo = getattr(hybrid_rag_engine, "backend_info", None) or {}
+    if binfo.get("degraded"):
+        pipeline_desc = "jieba BM25 关键词降级召回（未配置 Embedding Key）"
+    else:
+        emb_name = binfo.get("embedding", "BAAI/bge-m3")
+        vec_store = binfo.get("vectorStore", "pgvector-hnsw")
+        rerank_suffix = " + Cross-Encoder Rerank" if binfo.get("rerank") else ""
+        pipeline_desc = f"jieba BM25 + {emb_name} 向量（{vec_store}）+ RRF{rerank_suffix}"
     emit_thought(
         key=f"kg-retrieve-{retry + 1}",
         phase="knowledge",
         agent_label="知识问答子图",
-        title="正在执行 Hybrid RAG 双路召回…",
-        detail="并行计算 jieba BM25 稀疏词频与 512 维稠密向量余弦相似度，经 RRF(k=60) 重排",
+        title="正在执行 Hybrid RAG 双路召回…" if not binfo.get("degraded") else "正在执行 BM25 降级召回…",
+        detail=f"执行 {pipeline_desc}",
         status="running",
     )
     hits = await hybrid_rag_engine.search(rq, top_k=3)

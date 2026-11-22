@@ -18,20 +18,20 @@ for /f "usebackq tokens=1,* delims==" %%A in (".env") do (
     if not "%%A"=="" if not "%%A:~0,1%"=="#" set "%%A=%%B"
 )
 
-start "PulseTicket-UserService:8201" cmd /k "java -Xms128m -Xmx256m -jar user-service/target/user-service-1.0.0.jar"
-start "PulseTicket-ShowService:8202" cmd /k "java -Xms128m -Xmx256m -jar show-service/target/show-service-1.0.0.jar"
-start "PulseTicket-OrderService:8203" cmd /k "java -Xms128m -Xmx256m -jar order-service/target/order-service-1.0.0.jar"
-start "PulseTicket-Gateway:8200" cmd /k "java -Xms128m -Xmx256m -jar ticket-gateway/target/ticket-gateway-1.0.0.jar"
+start "PulseTicket-UserService:8201" cmd /k "java -Xms128m -Xmx256m -jar backend/user-service/target/user-service-1.0.0.jar"
+start "PulseTicket-ShowService:8202" cmd /k "java -Xms128m -Xmx256m -jar backend/show-service/target/show-service-1.0.0.jar"
+start "PulseTicket-OrderService:8203" cmd /k "java -Xms128m -Xmx256m -jar backend/order-service/target/order-service-1.0.0.jar"
+start "PulseTicket-Gateway:8200" cmd /k "java -Xms128m -Xmx256m -jar backend/ticket-gateway/target/ticket-gateway-1.0.0.jar"
 
-echo [4/5] 正在启动 Python Multi-Agent 智能体服务 (ticket-agent :8204)...
-if exist "ticket-agent\.venv\Scripts\python.exe" (
-    start "PulseTicket-Agent:8204" cmd /k "cd ticket-agent && .venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8204"
+echo [4/5] 正在启动 Python Multi-Agent 智能体服务 (agent / ticket-agent :8204)...
+if exist "agent\.venv\Scripts\python.exe" (
+    start "PulseTicket-Agent:8204" cmd /k "cd agent && .venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8204"
 ) else (
-    start "PulseTicket-Agent:8204" cmd /k "cd ticket-agent && python -m uvicorn app.main:app --host 0.0.0.0 --port 8204"
+    start "PulseTicket-Agent:8204" cmd /k "cd agent && python -m uvicorn app.main:app --host 0.0.0.0 --port 8204"
 )
 
 echo [5/5] 正在启动 Vue 3 + Tailwind CSS 选座与 AI 购票前端 (:5190)...
-start "PulseTicket-Web:5190" cmd /k "cd web && npm run dev"
+start "PulseTicket-Frontend:5190" cmd /k "cd frontend && npm run dev"
 
 echo ============================================================================
 echo   启动指令已下发！请访问前端地址: http://localhost:5190

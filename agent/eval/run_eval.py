@@ -110,11 +110,20 @@ async def run_evaluation():
                 failures.append(f"{cid}: injection not blocked -> {c['query']}")
 
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
+    backend_info = dict(getattr(hybrid_rag_engine, "backend_info", {}) or {})
+    degraded_flag = bool(backend_info.get("degraded", False))
+    degraded_str = "已降级（BM25-only，未配置 Embedding Key）" if degraded_flag else "正常（BM25 + 向量 + Rerank）"
+    backend_str = (
+        f"{backend_info.get('embedding', 'unknown')} / "
+        f"{backend_info.get('vectorStore', 'unknown')} / "
+        f"rerank={'on' if backend_info.get('rerank') else 'off'}"
+    )
 
     metrics = {
         "evaluatedAt": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "totalCases": len(cases),
         "indexedKnowledgeChunks": chunk_count,
+        "ragBackend": backend_info,
         "elapsedMs": elapsed_ms,
         "intentRouting": {
             "passed": routing_pass,
@@ -155,6 +164,8 @@ async def run_evaluation():
     report_md = f"""# PulseTicket Multi-Agent 自动化评测报告
 
 - **评测时间**：`{metrics['evaluatedAt']}`
+- **检索后端**：`{backend_str}`
+- **降级状态**：`{degraded_str}`
 - **基准用例总数**：`{metrics['totalCases']}` 条（知识库切分 `{chunk_count}` 个语义块）
 - **总耗时**：`{elapsed_ms} ms`
 

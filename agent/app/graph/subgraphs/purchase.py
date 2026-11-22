@@ -81,7 +81,7 @@ async def purchase_agent_node(state: PurchaseSubState) -> Dict[str, Any]:
     sys_text = (
         "你是 PulseTicket 的【选座购票专员 (Purchase Agent)】。\n"
         f"【共享上下文槽位】: {json.dumps(slots, ensure_ascii=False)}\n"
-        f"【历史对话摘要】: {state.get('history_summary') or '无'}\n"
+        f"【最近 3 轮对话】: {state.get('history_summary') or '无'}\n"
         f"【执行约束】: {commit_rule}\n"
         "严禁在同一条回复里同时混调只读工具和 `propose_create_order`；若后端服务不可达或无余座，必须如实说明。"
     )

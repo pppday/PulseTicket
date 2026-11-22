@@ -1,82 +1,111 @@
-# PulseTicket · 企业级演出与电影在线选座微服务系统
+# PulseTicket · 在线选座购票微服务与 Multi-Agent 智能票务系统
 
-> **个人简历项目三（Spring Cloud Alibaba 微服务全栈代表作）**
-> 基于 **Spring Cloud Alibaba 2023.0.1.0 + Spring Boot 3.2.5 + JDK 17 + Nacos + OpenFeign + Sentinel + Redisson + Seata AT + RabbitMQ (TTL + DLX 死信队列) + MySQL 8.0 + Vue 3 + TypeScript + Tailwind CSS** 构建的高并发演出票务选座与分布式事务微服务系统。
+[![Java 17](https://img.shields.io/badge/Java-17-orange.svg)](https://openjdk.org/projects/jdk/17/)
+[![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.2.5-brightgreen.svg)](https://spring.io/projects/spring-boot)
+[![Spring Cloud Alibaba](https://img.shields.io/badge/Spring%20Cloud%20Alibaba-2023.0.1.0-blue.svg)](https://sca.aliyun.com/)
+[![LangGraph](https://img.shields.io/badge/LangGraph-Multi--Agent-purple.svg)](https://langchain-ai.github.io/langgraph/)
+[![PostgreSQL pgvector](https://img.shields.io/badge/PostgreSQL%2016-pgvector%20HNSW-336791.svg)](https://github.com/pgvector/pgvector)
+[![Vue 3](https://img.shields.io/badge/Vue-3.4%20TypeScript-emerald.svg)](https://vuejs.org/)
+
+> **在线体验地址**：[`https://ticket.pppday.com`](https://ticket.pppday.com)
+> - **普通购票会员一键体验**：`zhaolan` / `Ticket@2026`（在线选座大厅、Multi-Agent 智能选座下单、7 天历史会话恢复）
+> - **架构运维管理员一键体验**：`admin` / `Admin@2026`（票房销量统计、三库实时看板、并发压测实验台、Agent 审计轨迹）
+
+基于 **Spring Cloud Alibaba 2023.0.1.0（Nacos + Gateway + OpenFeign + Sentinel + Seata AT）+ Redisson + RabbitMQ + MySQL 8.0 + PostgreSQL 16（pgvector）+ FastAPI / LangGraph + Vue 3** 构建的异构协同票务系统，完整打通**高并发选座防超卖**与**受控 Multi-Agent 智能客服购票闭环**。
 
 ---
 
-## 一、 为什么这个项目是中小厂/大厂实习面试的“满分收割机”？
+## 一、 系统架构与三层会话记忆设计
 
-在 Java 后端校招与日常实习面试中，面试官考察微服务项目最核心的 **6 大必考连环问**，在本项目中全部具备 **100% 真实可运行、可现场演示、可压测验证** 的工程落地：
+```mermaid
+flowchart TB
+    Web["Vue 3 + TypeScript 客户端 (:5190 / ticket.pppday.com)"] -->|"REST + SSE 流式"| GW["Spring Cloud Gateway (:8200)\n清洗伪造头 · JWT 验签透传"]
 
-| 核心考点 | 本项目工程落地实现 | 对应源码位置 |
+    subgraph JavaMS["Java 17 微服务集群"]
+        GW --> US["user-service (:8201)\n登录档案 · 积分电子票"]
+        GW --> SS["show-service (:8202)\nRedis 三防缓存 · 权威 /quote 核价"]
+        GW --> OS["order-service (:8203)\nRedissonMultiLock · Seata AT TM\n15m / 15s 双死信队列 CAS 关单"]
+        OS <-->|"OpenFeign + Seata TX_XID"| SS
+        OS -.->|"支付成功 Fanout MQ"| US
+    end
+
+    subgraph PyAgent["Python FastAPI + LangGraph Multi-Agent (:8204)"]
+        GW -->|/api/agent/**| Guard["input_guard 安全护栏\n防注入 / 防改价"]
+        Guard --> Router["intent_router 意图路由\n拆分队列 + 共享槽位 SharedSlots"]
+        Router --> KG["knowledge_agent\nAgentic RAG（改写/重排/拒答）"]
+        Router --> PA["purchase_agent\n选座推荐 + /quote 预检"]
+        Router --> OA["order_agent\n订单核查 + 确定性算费"]
+        KG & PA & OA --> Gate["confirm_action 写门控\ninterrupt() 确认卡片 · 15m 超时解锁"]
+    end
+
+    KG <-->|"bge-m3 1024d HNSW + jieba BM25 + bge-reranker-v2-m3"| PG[("PostgreSQL 16 (pgvector)\n① 向量知识库\n② 7 天滑动展示历史\n③ AsyncPostgresSaver 断点\n④ agent_trace_log 审计")]
+    Gate -->|"Command(resume) + Idempotency-Key"| OS
+```
+
+### 三层会话记忆与上下文工程（vs 模型污染防护）
+1. **展示历史层（PostgreSQL 16 `agent_conversation` / `agent_message`）**：按登录 `X-User-Id` 严格隔离，支持侧边栏「今天 / 昨天 / 近 7 天」分组检索与删除；每次对话或确认后基于**最后活跃时间滑动顺延 7 天**，定时清理任务联动 `AsyncPostgresSaver.adelete_thread` 同步释放断点状态。
+2. **模型上下文层（近 3 轮滑动窗口 + 结构化槽位）**：喂给路由与子图的上下文仅保留最近 **3 轮（6 条先序消息，助手长回复截断至 300 字符）**，配合 `SharedSlots` 透传演出/场次/预算/订单号，杜绝旧话题带来的 Context Rot 与无效 Token 膨胀。
+3. **执行断点层（`AsyncPostgresSaver` + 15 分钟卡片过期解锁）**：高风险锁座与退改写操作强制 `interrupt()` 挂起并生成服务端报价卡片；超过 15 分钟未点击确认则在访问历史线程或继续提问时自动释放旧断点并标记 `EXPIRED`，防止过期报价误下单。
+
+---
+
+## 二、 核心工程与 AI 落地亮点
+
+| 核心领域 | 工程落地实现 | 对应源码位置 |
 | :--- | :--- | :--- |
-| **1. 标准工程分层与解耦** | 抽离 `ticket-common`（统一 `Result<T>`、全局异常、分页、`ThreadLocal`）与独立 `ticket-feign-api`（存放 `@FeignClient` 契约、DTO 与 Sentinel `FallbackFactory`，彻底解决服务间循环依赖） | `ticket-common/`、`ticket-feign-api/` |
-| **2. Gateway + ThreadLocal + OpenFeign 三棒登录态透传** | ① `AuthGlobalFilter` 统一验签 JWT，**先 `remove` 客户端伪造同名请求头**，再注入 `X-User-Id` / `X-Username` / `X-Trace-Id`；<br>② 下游 `UserInfoInterceptor` 写入 `ThreadLocal`，并在 `afterCompletion` 中强制 `clear()` 防内存泄漏与线程串号；<br>③ `FeignRelayAutoConfig` 实现 `RequestInterceptor` 继续向下游透传身份头与 Seata `TX_XID`。 | `AuthGlobalFilter.java`、`UserContext.java`、`UserInfoInterceptor.java`、`FeignRelayAutoConfig.java` |
-| **3. Nacos 注册发现与共享配置中心** | 4 个微服务全部注册至 Nacos (`:8848`)，并将 MySQL、Redis、RabbitMQ、JWT 公共配置抽离为 `shared-jdbc.yaml`、`shared-redis.yaml`、`shared-mq.yaml`、`shared-jwt.yaml` 统一管理。 | `tools/init_nacos_configs.py` |
-| **4. Redis 缓存三座大山防护** | 演出详情查询完整落地：① **防穿透**：不存在 ID 写入 `__NULL__` 空值哨兵（60s 短 TTL）；② **防击穿**：热点失效使用 Redisson `RLock` 互斥锁 + 双重检查锁重建；③ **防雪崩**：基础 TTL 1800s + 随机抖动 60~360s。 | `ShowCacheAndSeatService.java` |
-| **5. Redisson 三层防重锁 + 锁包在事务外** | 外层非事务 `OrderFacade` 先加 **用户防连点锁 (`lock:order:submit:{userId}`，不设 leaseTime 启用 30s WatchDog 自动续期)** + **按 `seatId` 升序排列的 `RedissonMultiLock` 联锁（消除交叉死锁）**，再进入内层 `@GlobalTransactional OrderTxService`，并在 `finally` 中（事务提交后）释放锁。 | `OrderFacade.java`、`OrderTxService.java` |
-| **6. Seata AT 跨库事务 + RabbitMQ 死信延迟关单与消费幂等** | ① **同步跨库锁座**：`order-service` (TM) 同步 Feign 调 `show-service` (RM) 锁定座位，基于 `undo_log` 前后镜像实现异常自动回滚（支持前端一键注入故障回滚演练）；<br>② **异步延迟关单**：拆分为 `15m` 标准队列与 `15s` 极速演示队列（彻底规避单队列不同 TTL 的**队头阻塞问题**），到期路由至死信交换机触发 `WHERE status='UNPAID'` 的 CAS 自动关单并归还座位；<br>③ **支付成功 Fanout 广播与幂等**：`user-service` 消费加积分与发电子票通知，依赖 `UNIQUE KEY uk_order_biz (order_no, biz_type)` 保证 100% 消费幂等。 | `OrderTxService.java`、`OrderMqConfigAndListener.java`、`UserOrderPaidConsumer.java` |
-| **7. 主 Graph + 3 子图 Multi-Agent 编排与资金确定性兜底** | ① **意图路由 + 子图隔离**：主图通过 `input_guard` 防注入护栏与 `intent_router` 将复合提问拆解为有序意图队列，按序调度 **知识问答子图（Agentic RAG：查询改写 → BM25+向量+RRF → 证据充分性判定 → 盲区诚实拒答）**、**选座购票子图** 与 **订单售后子图（确定性阶梯退票算费）**；<br>② **零幻觉核价与幂等确认**：写操作强制向 Java 服务端 `/quote` 重新核验价格与余座，通过 LangGraph `interrupt()` 推送 SSE 确认卡片，用户点击后携带 `thread_id:tool_call_id` 幂等键执行真实创单。 | `ticket-agent/app/graph/`、`AgentChatWidget.vue` |
+| **1. 微服务分层与三棒身份透传** | 抽离 `ticket-common` 与 `ticket-feign-api`（DTO + Sentinel `FallbackFactory`）；Gateway `AuthGlobalFilter` 先 `remove` 客户端伪造请求头再注入校验后的 `X-User-Id` / `X-Username` / `X-Trace-Id`，下游经 `UserInfoInterceptor` (`ThreadLocal` 强制 `clear()`) 与 `FeignRelayAutoConfig` 全链路透传。 | `backend/ticket-common/`、`backend/ticket-feign-api/`、`backend/ticket-gateway/` |
+| **2. Redis 缓存三防 + Redisson 三层防超卖** | 演出详情查询落地空值哨兵 `__NULL__` + Redisson `RLock` 互斥锁重建 + 随机抖动 TTL；`OrderFacade` 将锁包在 `@GlobalTransactional` 事务外，组合用户防重锁与按 `seatId` 升序排列的 `RedissonMultiLock`（消除死锁）+ DB 条件更新兜底，**30 线程压测 1 单成功、0 超卖**。 | `ShowCacheAndSeatService.java`、`OrderFacade.java`、`OrderTxService.java` |
+| **3. Seata AT 回滚与双死信队列防队头阻塞** | 跨库锁座异常通过 Seata `undo_log` 自动回滚；RabbitMQ 订单超时关单拆分为 `15m` 标准队列与 `15s` 极速演示队列，消除单队列不同 TTL 的队头阻塞，触发 `WHERE status='UNPAID'` CAS 关单，唯一索引 `uk_order_biz` 保证积分消费幂等。 | `OrderMqConfigAndListener.java`、`UserOrderPaidConsumer.java` |
+| **4. Agentic Hybrid RAG 与诚实降级** | 知识库按 `##` 二级标题 + `500` 字滑窗（`50` 字重叠）切分，经 `BAAI/bge-m3` 存入 **PostgreSQL 16（pgvector HNSW）**，与 `jieba BM25` 双路 RRF 融合并调用 `BAAI/bge-reranker-v2-m3` 精排；证据不足触发改写重试 1 次，仍不足诚实拒答且强制引用 `[POL-xxx]`；无 Embedding Key 时自动降级 `BM25-only` 并显式标注 `degraded=true`。 | `agent/app/rag/hybrid_rag.py`、`agent/app/graph/subgraphs/knowledge.py` |
+| **5. 54 条真实端到端基准评测** | 全真实调用 `pgvector-hnsw + BAAI/bge-m3 + bge-reranker-v2-m3` 跑完 54 条测试集：意图路由 **12/12 (100%)**、RAG Hit@1 与 Hit@3 **20/20 (100%)**、盲区拒答 **8/8 (100%)**、确定性退票算费 **6/6 (100%)**、注入与改价拦截 **8/8 (100%)**、未确认写 **0 次**。 | `agent/eval/run_eval.py`、`agent/eval/latest_metrics.json` |
 
 ---
 
-## 二、 系统模块与端口拓扑
+## 三、 模块拓扑
 
 ```text
 pulseticket/
-├── pom.xml                       # Maven 父工程 (Spring Boot 3.2.5 + Spring Cloud Alibaba 2023.0.1.0)
-├── ticket-common/                # 公共基础模块 (Result / BizException / UserContext ThreadLocal / JwtUtils)
-├── ticket-feign-api/             # 独立远程调用契约模块 (ShowSeatClient / DTO / Sentinel FallbackFactory / Feign 透传)
-├── ticket-gateway/               # API 网关服务 (:8200) -> 路由鉴权、防伪造头清洗、转发 /api/agent/**
-├── user-service/                 # 用户与积分服务 (:8201, DB: ticket_user) -> JWT 登录、ThreadLocal 档案、MQ 幂等积分与站内信
-├── show-service/                 # 演出与座位库存服务 (:8202, DB: ticket_show) -> Redis 三防缓存、服务端权威核价 /quote、Seata AT 锁座 RM
-├── order-service/                # 订单与事务协调服务 (:8203, DB: ticket_order) -> Redisson 三层锁、Idempotency-Key 幂等、Seata AT TM、RabbitMQ DLX
-├── ticket-agent/                 # Python Multi-Agent 智能体服务 (:8204) -> 主 Graph + 3 子图、Hybrid RAG、SSE 流式、Trace 审计与 40 条离线评测集
-├── web/                          # Vue 3 + TypeScript + Tailwind CSS 选座大厅、AI 悬浮对话窗与实时观测前端 (:5190)
-├── deploy/                       # Docker Compose (Redis / RabbitMQ / Nacos / Seata) 与三库 SQL 初始化脚本
-├── tools/                        # Nacos 配置初始化脚本与 6 大微服务场景全自动端到端验收脚本 (verify_microservices.py)
-└── docs/                         # 配套渐进式源码拆解讲义与思考题
+├── backend/                          # Java 17 微服务 (Spring Boot 3.2.5 + Spring Cloud Alibaba 2023.0.1.0)
+│   ├── ticket-common/                # 统一 Result / BizException / ThreadLocal 上下文 / JwtUtils
+│   ├── ticket-feign-api/             # ShowSeatClient / DTO / Sentinel Fallback / Feign 拦截器
+│   ├── ticket-gateway/               # API 网关 (:8200) -> JWT 鉴权、防伪造清洗、转发 /api/agent/**
+│   ├── user-service/                 # 用户与积分 (:8201, MySQL: ticket_user)
+│   ├── show-service/                 # 演出库存与权威核价 (:8202, MySQL: ticket_show)
+│   └── order-service/                # 订单、锁座、Seata TM 与 DLX 关单 (:8203, MySQL: ticket_order)
+├── agent/                            # Python Multi-Agent (:8204)
+│   ├── app/graph/                    # 主 Graph 编排、安全护栏、3 个隔离业务子图
+│   ├── app/rag/                      # pgvector HNSW + jieba BM25 + RRF + Cross-Encoder 混合检索
+│   ├── app/storage/                  # PostgreSQL 16 7天展示历史与 15m 卡片失效管理
+│   ├── app/observability/            # PostgreSQL agent_trace_log 全链路审计
+│   └── tests/ & eval/                # 22 条单元测试 + 54 条真实 RAG/Agent 评测集
+├── frontend/                         # Vue 3 + TypeScript + Tailwind CSS 选座大厅、历史对话抽屉与遥测看板
+├── deploy/                           # Docker Compose (MySQL / Redis / RabbitMQ / Nacos / Seata / pgvector)
+└── tools/                            # Nacos 配置初始化与 6 大微服务自动端到端验收脚本
 ```
 
 ---
 
-## 三、 快速启动与全链路自动化验收
+## 四、 本地启动与自动化测试
 
-### 1. 一键启动全栈环境
-双击运行根目录下的 [`start_dev.bat`](file:///c:/Users/lan/Desktop/项目/pulseticket/start_dev.bat)，或按顺序执行：
 ```powershell
-# 1. 启动中间件容器
+# 1. 启动中间件（含 pgvector/pgvector:pg16、MySQL、Redis、RabbitMQ、Nacos、Seata）
 docker compose -f deploy/docker-compose.yml up -d
 
-# 2. 初始化 Nacos 共享配置
+# 2. 复制环境变量模板并填入真实 Key（切勿提交 .env）
+Copy-Item .env.example .env
+
+# 3. 编译 Java 微服务并通过 Nacos 初始化配置后启动
+mvn -f backend/pom.xml clean package -DskipTests
 python tools/init_nacos_configs.py
 
-# 3. 编译打包全部微服务模块
-mvn clean package -DskipTests
-```
-
-### 2. 运行端到端全自动验证套件 (`verify_microservices.py`)
-```powershell
-python -X utf8 tools/verify_microservices.py
-```
-该脚本将自动通过网关 (`:8200`) 完整验证：
-1. **Gateway JWT 鉴权 + `ThreadLocal` 透传 + `/internal/**` 外部隔离**
-2. **Redis 缓存三座大山防护**（互斥锁重建 `MYSQL_MUTEX_REBUILT`、缓存命中 `REDIS_HIT`、空值哨兵 `PENETRATION_PROTECTED` -> `REDIS_NULL_GUARD`）
-3. **30 线程并发争抢同一个座位压测**（验证严格 **1 单成功、29 单被拦截、0 超卖**）
-4. **Seata AT 二阶段故障注入与跨库自动回滚**（验证异常后座位自动由 `LOCKED` 恢复为 `AVAILABLE`，且记录 `ROLLED_BACK` 审计日志）
-5. **订单支付 + RabbitMQ Fanout 广播**（验证座位变更为 `SOLD`、用户积分幂等增加、签发电子票核验码）
-6. **RabbitMQ 15 秒极速死信延迟关单**（等待 16.5 秒验证订单自动变更为 `CLOSED (TIMEOUT_UNPAID)` 且座位自动恢复为 `AVAILABLE`）
-
-### 3. 运行 AI Multi-Agent 单元测试与 40 条基准评测集
-```powershell
-cd ticket-agent
+# 4. 运行 Python Agent 全套 22 条单元测试与 54 条评测集
+cd agent
 python -X utf8 -m unittest discover -s tests -v
 python -X utf8 eval/run_eval.py
 ```
 
 ---
 
-## 四、 配套源码精读讲义（含课后思考题与参考答案）
-- [01_核心链路拆解_Redisson三层锁与Seata分布式事务.md](file:///c:/Users/lan/Desktop/项目/pulseticket/docs/01_核心链路拆解_Redisson三层锁与Seata分布式事务.md)
-- [02_核心链路拆解_RabbitMQ死信关单与缓存幂等.md](file:///c:/Users/lan/Desktop/项目/pulseticket/docs/02_核心链路拆解_RabbitMQ死信关单与缓存幂等.md)
+## 五、 配套源码精读讲义
+- [01_核心链路拆解_Redisson三层锁与Seata分布式事务.md](./docs/01_核心链路拆解_Redisson三层锁与Seata分布式事务.md)
+- [02_核心链路拆解_RabbitMQ死信关单与缓存幂等.md](./docs/02_核心链路拆解_RabbitMQ死信关单与缓存幂等.md)

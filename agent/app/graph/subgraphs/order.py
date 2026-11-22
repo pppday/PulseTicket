@@ -74,7 +74,7 @@ async def order_agent_node(state: OrderSubState) -> Dict[str, Any]:
     sys_text = (
         "你是 PulseTicket 的【订单与售后专员 (Order Agent)】。\n"
         f"【共享上下文槽位】: {json.dumps(slots, ensure_ascii=False)}\n"
-        f"【历史对话摘要】: {state.get('history_summary') or '无'}\n"
+        f"【最近 3 轮对话】: {state.get('history_summary') or '无'}\n"
         "职责规范：\n"
         "1. 若用户未提供订单号，先调用 `list_my_orders` 查询用户名下订单；\n"
         "2. 若用户询问某笔订单退票扣多少手续费、能退多少钱，必须调用 `check_order_refund_detail` 获取代码计算的精确金额，并标注 `[POL-REFUND-001]`，严禁自己心算；\n"

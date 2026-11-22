@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime
 import json
 import re
 import time
@@ -23,6 +24,7 @@ from app.graph.subgraphs import (
     build_purchase_subgraph,
 )
 from app.observability.tracer import AgentTracer, agent_tracer
+from app.storage.conversation_store import ConversationStore, conversation_store, to_iso_utc, utc_now
 from app.tools.ticket_tools import current_user_ctx, execute_confirmed_write_action
 
 # 预编译三大业务子图（主图将它们作为黑盒专员节点按序调度，子图间严禁互相网状调用）
@@ -476,29 +478,197 @@ class MultiAgentTicketManager:
 
     def __init__(
         self,
-        db_path: str = settings.CHECKPOINT_DB_PATH,
+        db_path: Optional[str] = None,
+        postgres_dsn: Optional[str] = None,
         tracer: Optional[AgentTracer] = None,
+        conv_store: Optional[ConversationStore] = None,
+        enable_cleanup_loop: Optional[bool] = None,
     ):
-        self.db_path = db_path
+        if db_path is not None:
+            self._use_postgres = False
+            self.db_path = db_path
+            self.postgres_dsn = ""
+        else:
+            dsn = (postgres_dsn if postgres_dsn is not None else settings.CHECKPOINT_POSTGRES_DSN).strip()
+            if dsn:
+                self._use_postgres = True
+                self.postgres_dsn = dsn
+                self.db_path = ""
+            else:
+                self._use_postgres = False
+                self.postgres_dsn = ""
+                self.db_path = settings.CHECKPOINT_DB_PATH
         self.tracer = tracer or agent_tracer
+        if conv_store is not None:
+            self.conv_store = conv_store
+        elif db_path is not None:
+            self.conv_store = ConversationStore(
+                db_path=str(Path(db_path).with_name("test_conversations.sqlite"))
+            )
+        else:
+            self.conv_store = conversation_store
+
+        if enable_cleanup_loop is not None:
+            self._enable_cleanup_loop = enable_cleanup_loop
+        else:
+            self._enable_cleanup_loop = (db_path is None)
+
+        self._pg_pool: Any = None
         self._conn: Optional[aiosqlite.Connection] = None
-        self._checkpointer: Optional[AsyncSqliteSaver] = None
+        self._checkpointer: Any = None
+        self._cleanup_task: Optional[asyncio.Task] = None
         self.graph = None
 
+    @property
+    def checkpoint_backend(self) -> str:
+        return "postgresql-async" if self._use_postgres else "sqlite-fallback"
+
     async def startup(self):
-        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = await aiosqlite.connect(self.db_path)
-        self._checkpointer = AsyncSqliteSaver(self._conn)
-        await self._checkpointer.setup()
+        if self._use_postgres:
+            from psycopg.rows import dict_row
+            from psycopg_pool import AsyncConnectionPool
+            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+            self._pg_pool = AsyncConnectionPool(
+                conninfo=self.postgres_dsn,
+                min_size=1,
+                max_size=5,
+                open=False,
+                kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
+            )
+            await self._pg_pool.open()
+            self._checkpointer = AsyncPostgresSaver(self._pg_pool)
+            await self._checkpointer.setup()
+        else:
+            Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+            self._conn = await aiosqlite.connect(self.db_path)
+            self._checkpointer = AsyncSqliteSaver(self._conn)
+            await self._checkpointer.setup()
         await self.tracer.ensure_schema()
+        await self.conv_store.ensure_schema()
         self.graph = build_main_agent_graph().compile(checkpointer=self._checkpointer)
+        if self._enable_cleanup_loop and self._cleanup_task is None:
+            self._cleanup_task = asyncio.create_task(self._cleanup_loop())
 
     async def shutdown(self):
+        if self._cleanup_task is not None:
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+            self._cleanup_task = None
+        if self._pg_pool is not None:
+            await self._pg_pool.close()
+            self._pg_pool = None
         if self._conn is not None:
             await self._conn.close()
             self._conn = None
-            self._checkpointer = None
-            self.graph = None
+        self._checkpointer = None
+        self.graph = None
+
+    async def _delete_checkpoint_thread(self, thread_id: str) -> None:
+        if self._checkpointer is not None and hasattr(self._checkpointer, "adelete_thread"):
+            try:
+                await self._checkpointer.adelete_thread(thread_id)
+            except Exception as exc:
+                print(f"[PulseTicket Agent] 清理 checkpoint 失败 thread={thread_id}: {exc}")
+
+    async def cleanup_expired_threads(self, now: Optional[datetime] = None) -> int:
+        expired_ids = await self.conv_store.purge_expired_threads(now=now)
+        for tid in expired_ids:
+            await self._delete_checkpoint_thread(tid)
+        return len(expired_ids)
+
+    async def _cleanup_loop(self) -> None:
+        interval = max(60, int(settings.CLEANUP_INTERVAL_SEC))
+        while True:
+            try:
+                removed = await self.cleanup_expired_threads()
+                if removed > 0:
+                    print(f"[PulseTicket Agent] 自动清理 {removed} 个超过 {settings.CONVERSATION_TTL_DAYS} 天未活跃会话")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"[PulseTicket Agent] 定时清理任务异常: {exc}")
+            await asyncio.sleep(interval)
+
+    async def _expire_stale_pending_if_needed(
+        self,
+        thread_id: str,
+        config: Dict[str, Any],
+        now: Optional[datetime] = None,
+    ) -> bool:
+        conv = await self.conv_store.get_conversation(thread_id)
+        if not conv or not self.conv_store.is_pending_expired(conv, now=now):
+            return False
+        if self.graph is not None:
+            snap = await self.graph.aget_state(config)
+            if snap and snap.next:
+                try:
+                    await self.graph.ainvoke(Command(resume={"confirmed": False}), config=config)
+                except Exception:
+                    pass
+        await self.conv_store.mark_pending_expired(thread_id)
+        return True
+
+    async def list_threads(
+        self,
+        user_id: int,
+        limit: int = 30,
+        now: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
+        if self.graph is None:
+            await self.startup()
+        return await self.conv_store.list_threads(user_id=user_id, limit=limit, now=now)
+
+    async def get_thread_detail(
+        self,
+        thread_id: str,
+        user_id: int,
+        now: Optional[datetime] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if self.graph is None:
+            await self.startup()
+        conv = await self.conv_store.assert_owner(thread_id, user_id)
+        if conv is None:
+            return None
+        now_dt = now or utc_now()
+        if conv["expires_at"] <= to_iso_utc(now_dt):
+            return None
+
+        config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 25}
+        prev_snap = await self.graph.aget_state(config)
+        self._assert_thread_owner(prev_snap, user_id)
+
+        expired = await self._expire_stale_pending_if_needed(thread_id, config, now=now_dt)
+        if expired:
+            conv = await self.conv_store.get_conversation(thread_id)
+        messages = await self.conv_store.get_thread_messages(thread_id)
+        pending_card = None
+        if conv and conv.get("pending_card_json"):
+            pending_card = json.loads(conv["pending_card_json"])
+
+        return {
+            "threadId": conv["thread_id"],
+            "title": conv["title"],
+            "status": "INTERRUPTED" if pending_card else "ACTIVE",
+            "pendingCard": pending_card,
+            "pendingCardExpired": expired,
+            "expiresAt": conv["expires_at"],
+            "updatedAt": conv["updated_at"],
+            "messages": messages,
+        }
+
+    async def delete_thread(self, thread_id: str, user_id: int) -> bool:
+        if self.graph is None:
+            await self.startup()
+        config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 25}
+        prev_snap = await self.graph.aget_state(config)
+        self._assert_thread_owner(prev_snap, user_id)
+        deleted = await self.conv_store.delete_thread(thread_id, user_id)
+        await self._delete_checkpoint_thread(thread_id)
+        return deleted
 
     @staticmethod
     def _validate_user(user_id: int, username: str, user_role: str = "USER") -> Dict[str, Any]:
@@ -561,6 +731,8 @@ class MultiAgentTicketManager:
         config: Dict[str, Any],
         t0: float,
         thinking_steps: Optional[List[Dict[str, Any]]] = None,
+        resolve_pending_decision: Optional[str] = None,
+        record_user_msg: bool = True,
     ) -> Dict[str, Any]:
         snapshot = await self.graph.aget_state(config)
         vals = snapshot.values if (snapshot and snapshot.values) else {}
@@ -604,6 +776,25 @@ class MultiAgentTicketManager:
             reply=reply_text,
         )
 
+        evicted = await self.conv_store.record_turn(
+            thread_id=thread_id,
+            user_id=user_info["user_id"],
+            username=user_info["username"],
+            user_message=user_message,
+            assistant_reply=reply_text,
+            status=status,
+            intents=intents,
+            subgraphs=subgraphs,
+            citations=citations,
+            thinking_steps=list(thinking_steps or []),
+            confirmation_card=confirmation_card,
+            latency_ms=latency_ms,
+            record_user_msg=record_user_msg,
+            resolve_pending_decision=resolve_pending_decision,
+        )
+        for evicted_tid in evicted:
+            await self._delete_checkpoint_thread(evicted_tid)
+
         return {
             "traceId": trace_id,
             "threadId": thread_id,
@@ -635,13 +826,19 @@ class MultiAgentTicketManager:
         config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 25}
         prev_snap = await self.graph.aget_state(config)
         self._assert_thread_owner(prev_snap, user_info["user_id"])
+        await self.conv_store.assert_owner(thread_id, user_info["user_id"])
 
+        if await self._expire_stale_pending_if_needed(thread_id, config):
+            prev_snap = await self.graph.aget_state(config)
+
+        pending_resolved: Optional[str] = None
         with ThoughtSession(use_queue=False) as ts:
             # P0-6：挂起等待卡片确认时收到新消息
             if prev_snap and prev_snap.next:
                 pending_card = _extract_interrupt_card(prev_snap)
                 if _is_explicit_cancel_intent(user_message):
                     await self.graph.ainvoke(Command(resume={"confirmed": False}), config=config)
+                    pending_resolved = "REJECTED"
                     if _is_pure_cancel_phrase(user_message):
                         return await self._finalize_payload(
                             trace_id=trace_id,
@@ -652,6 +849,7 @@ class MultiAgentTicketManager:
                             config=config,
                             t0=t0,
                             thinking_steps=ts.steps,
+                            resolve_pending_decision="REJECTED",
                         )
                 else:
                     card_title = (pending_card or {}).get("title") or "待确认操作"
@@ -669,6 +867,24 @@ class MultiAgentTicketManager:
                         "为保障座位与资金安全，请直接点击确认卡片上的【确认】或【暂不执行】按钮；"
                         "若想放弃当前操作再咨询其他问题，请回复“放弃当前操作”。"
                     )
+                    latency_ms = int((time.perf_counter() - t0) * 1000)
+                    evicted = await self.conv_store.record_turn(
+                        thread_id=thread_id,
+                        user_id=user_info["user_id"],
+                        username=user_info["username"],
+                        user_message=user_message,
+                        assistant_reply=hold_reply,
+                        status="INTERRUPTED",
+                        intents=[],
+                        subgraphs=["pending_resolver"],
+                        citations=[],
+                        thinking_steps=list(ts.steps),
+                        confirmation_card=pending_card,
+                        latency_ms=latency_ms,
+                        preserve_existing_pending=True,
+                    )
+                    for evicted_tid in evicted:
+                        await self._delete_checkpoint_thread(evicted_tid)
                     return {
                         "traceId": trace_id,
                         "threadId": thread_id,
@@ -680,7 +896,7 @@ class MultiAgentTicketManager:
                         "toolSteps": [],
                         "thinkingSteps": list(ts.steps),
                         "confirmationCard": pending_card,
-                        "latencyMs": int((time.perf_counter() - t0) * 1000),
+                        "latencyMs": latency_ms,
                     }
 
             input_state: MainGraphState = {
@@ -700,6 +916,7 @@ class MultiAgentTicketManager:
                 config=config,
                 t0=t0,
                 thinking_steps=ts.steps,
+                resolve_pending_decision=pending_resolved,
             )
 
     async def confirm(
@@ -719,6 +936,10 @@ class MultiAgentTicketManager:
         config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 25}
         prev_snap = await self.graph.aget_state(config)
         self._assert_thread_owner(prev_snap, user_info["user_id"])
+        await self.conv_store.assert_owner(thread_id, user_info["user_id"])
+
+        if await self._expire_stale_pending_if_needed(thread_id, config):
+            raise ValueError("该确认卡片报价已超过 15 分钟有效期，已自动失效，请重新选座核价。")
 
         if not prev_snap or not prev_snap.next:
             raise ValueError(f"会话 {thread_id} 当前没有处于等待人工确认的挂起操作")
@@ -734,6 +955,8 @@ class MultiAgentTicketManager:
                 config=config,
                 t0=t0,
                 thinking_steps=ts.steps,
+                resolve_pending_decision="CONFIRMED" if confirmed else "REJECTED",
+                record_user_msg=False,
             )
 
     async def stream_chat(
@@ -754,6 +977,10 @@ class MultiAgentTicketManager:
         config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 25}
         prev_snap = await self.graph.aget_state(config)
         self._assert_thread_owner(prev_snap, user_info["user_id"])
+        await self.conv_store.assert_owner(thread_id, user_info["user_id"])
+
+        if await self._expire_stale_pending_if_needed(thread_id, config):
+            prev_snap = await self.graph.aget_state(config)
 
         if prev_snap and prev_snap.next:
             res = await self.chat(thread_id, user_message, user_id, username, user_role)
@@ -849,6 +1076,11 @@ class MultiAgentTicketManager:
         config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 25}
         prev_snap = await self.graph.aget_state(config)
         self._assert_thread_owner(prev_snap, user_info["user_id"])
+        await self.conv_store.assert_owner(thread_id, user_info["user_id"])
+
+        if await self._expire_stale_pending_if_needed(thread_id, config):
+            raise ValueError("该确认卡片报价已超过 15 分钟有效期，已自动失效，请重新选座核价。")
+
         if not prev_snap or not prev_snap.next:
             raise ValueError(f"会话 {thread_id} 当前没有处于等待人工确认的挂起操作")
 
@@ -879,6 +1111,8 @@ class MultiAgentTicketManager:
                 config=config,
                 t0=t0,
                 thinking_steps=ts.steps,
+                resolve_pending_decision="CONFIRMED" if confirmed else "REJECTED",
+                record_user_msg=False,
             )
 
         text = res.get("reply") or ""

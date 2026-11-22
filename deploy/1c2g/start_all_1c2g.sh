@@ -6,7 +6,11 @@ export PATH="/opt/jdk17/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/s
 BASE_DIR="/opt/pulseticket"
 JAR_DIR="$BASE_DIR/jars"
 LOG_DIR="$BASE_DIR/logs"
-AGENT_DIR="$BASE_DIR/ticket-agent"
+if [ -d "$BASE_DIR/agent" ]; then
+    AGENT_DIR="$BASE_DIR/agent"
+else
+    AGENT_DIR="$BASE_DIR/ticket-agent"
+fi
 mkdir -p "$LOG_DIR"
 
 if [ -f "$BASE_DIR/.env" ]; then

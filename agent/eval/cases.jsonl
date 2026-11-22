@@ -18,12 +18,26 @@
 {"id": "RAG-06", "category": "rag_covered", "query": "长沙梅溪湖国际文化艺术中心大剧院坐地铁几号线哪个口出？", "expected_doc": "POL-VENUE-003"}
 {"id": "RAG-07", "category": "rag_covered", "query": "锁座下单之后多久不付款会自动取消释放座位？单笔最多买几张？", "expected_doc": "POL-LOCK-004"}
 {"id": "RAG-08", "category": "rag_covered", "query": "上海梅赛德斯奔驰文化中心和北京天桥艺术中心分别坐几号线地铁？", "expected_doc": "POL-VENUE-005"}
+{"id": "RAG-09", "category": "rag_covered", "query": "因为台风天气演出被主办方延期或者取消了，票款能全额退吗？大概要几天到账？", "expected_doc": "POL-REFUND-001"}
+{"id": "RAG-10", "category": "rag_covered", "query": "我买错了同场次的座位，能不能直接补差价换到内场VIP区？", "expected_doc": "POL-REFUND-001"}
+{"id": "RAG-11", "category": "rag_covered", "query": "刚下的单还没付钱，现在不想要了怎么取消会扣手续费吗？", "expected_doc": "POL-REFUND-001"}
+{"id": "RAG-12", "category": "rag_covered", "query": "去看交响音乐会路上堵车迟到了还能进场坐吗？", "expected_doc": "POL-VERIFY-002"}
+{"id": "RAG-13", "category": "rag_covered", "query": "忘了带实体身份证，用手机里的电子身份证或者电子社保卡能过闸机吗？", "expected_doc": "POL-VERIFY-002"}
+{"id": "RAG-14", "category": "rag_covered", "query": "去长沙贺龙体育中心看演唱会坐几号线地铁到哪个站？", "expected_doc": "POL-VENUE-003"}
+{"id": "RAG-15", "category": "rag_covered", "query": "带了28寸拉杆箱和相机的三脚架去长沙音乐厅，安检外边有地方存吗？", "expected_doc": "POL-VENUE-003"}
+{"id": "RAG-16", "category": "rag_covered", "query": "去长沙音乐厅听演奏会地铁坐到北辰三角洲站从哪个口出来？", "expected_doc": "POL-VENUE-003"}
+{"id": "RAG-17", "category": "rag_covered", "query": "演艺厅里哪几排属于中轴声场优选区？一共有多少个座位？", "expected_doc": "POL-LOCK-004"}
+{"id": "RAG-18", "category": "rag_covered", "query": "用AI助手选连座的时候它怎么帮我们挑位置？会挑到已经被别人锁的座吗？", "expected_doc": "POL-LOCK-004"}
+{"id": "RAG-19", "category": "rag_covered", "query": "深圳万象城IMAX影厅坐地铁到哪个站下车？", "expected_doc": "POL-VENUE-005"}
+{"id": "RAG-20", "category": "rag_covered", "query": "杭州大麦66 Livehouse坐几号线地铁过去，要提前多久到场检票？", "expected_doc": "POL-VENUE-005"}
 {"id": "REF-01", "category": "rag_refusal", "query": "买完演出票怎么开具增值税专用发票用于公司报销？"}
 {"id": "REF-02", "category": "rag_refusal", "query": "请问支持顺丰快递邮寄纸质纪念票根到家吗？邮费怎么算？"}
 {"id": "REF-03", "category": "rag_refusal", "query": "我可以带小型宠物泰迪犬一起进场看演出吗？"}
 {"id": "REF-04", "category": "rag_refusal", "query": "请问充值多少积分才能升级成黑钻会员享受优先购票？"}
 {"id": "REF-05", "category": "rag_refusal", "query": "大学生凭学生证买票有没有五折半价优惠？"}
 {"id": "REF-06", "category": "rag_refusal", "query": "场馆里面有没有共享充电宝租借服务？多少钱一小时？"}
+{"id": "REF-07", "category": "rag_refusal", "query": "家里的老人六十多岁了买演出票有没有老年优惠或者军人优待票？"}
+{"id": "REF-08", "category": "rag_refusal", "query": "演出散场太晚了，平台有没有合作打折的场馆周边酒店可以一起预订？"}
 {"id": "FEE-01", "category": "refund_math", "amount": 1360.0, "start_time": "2026-11-28 19:30:00", "now": "2026-11-18 19:30:00", "expected_refundable": true, "expected_fee": 0.0, "expected_refund": 1360.0}
 {"id": "FEE-02", "category": "refund_math", "amount": 1360.0, "start_time": "2026-11-25 19:30:00", "now": "2026-11-18 19:30:00", "expected_refundable": true, "expected_fee": 0.0, "expected_refund": 1360.0}
 {"id": "FEE-03", "category": "refund_math", "amount": 1360.0, "start_time": "2026-11-21 19:30:00", "now": "2026-11-18 19:30:00", "expected_refundable": true, "expected_fee": 136.0, "expected_refund": 1224.0}

@@ -2,8 +2,10 @@
 .env
 .env.local
 .env.*.local
-web/.env
-web/.env.local
+agent/.env
+agent/.env.*
+frontend/.env
+frontend/.env.local
 
 # Maven & Java
 **/target/
@@ -16,16 +18,19 @@ logs/
 seata/
 
 # Node & Vue
-web/node_modules/
-web/dist/
+frontend/node_modules/
+frontend/dist/
 *.tsbuildinfo
 
 # Python & Agent
 .venv/
 venv/
+agent/.venv/
+agent/venv/
 **/__pycache__/
 *.py[cod]
-ticket-agent/data/*.sqlite*
+agent/data/*.sqlite*
+agent/data/*.json
 
 # IDE & OS
 .idea/

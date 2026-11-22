@@ -83,3 +83,29 @@ services:
       - "127.0.0.1:8091:8091"
     mem_limit: 210m
     restart: unless-stopped
+
+  pulseticket-pgvector:
+    image: pgvector/pgvector:pg16
+    container_name: pulseticket-pgvector
+    cpu_shares: 512
+    environment:
+      POSTGRES_DB: pulseticket_rag
+      POSTGRES_USER: pulseticket
+      POSTGRES_PASSWORD: pulseticket
+      TZ: Asia/Shanghai
+    command:
+      - postgres
+      - -c
+      - shared_buffers=24MB
+      - -c
+      - work_mem=2MB
+      - -c
+      - effective_cache_size=48MB
+      - -c
+      - max_connections=25
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - ./pgvector-data:/var/lib/postgresql/data
+    mem_limit: 160m
+    restart: unless-stopped

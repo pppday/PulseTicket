@@ -1,23 +1,30 @@
 {
-  "evaluatedAt": "2026-11-18 16:41:45",
-  "totalCases": 40,
+  "evaluatedAt": "2026-11-21 16:54:22",
+  "totalCases": 54,
   "indexedKnowledgeChunks": 14,
-  "elapsedMs": 503,
+  "ragBackend": {
+    "embedding": "BAAI/bge-m3",
+    "dim": 1024,
+    "vectorStore": "pgvector-hnsw",
+    "rerank": true,
+    "degraded": false
+  },
+  "elapsedMs": 54055,
   "intentRouting": {
     "passed": 12,
     "total": 12,
     "accuracyPct": 100.0
   },
   "hybridRag": {
-    "hitAt1": 8,
-    "hitAt3": 8,
-    "total": 8,
+    "hitAt1": 20,
+    "hitAt3": 20,
+    "total": 20,
     "hitAt1Pct": 100.0,
     "hitAt3Pct": 100.0
   },
   "outOfScopeRefusal": {
-    "passed": 6,
-    "total": 6,
+    "passed": 8,
+    "total": 8,
     "accuracyPct": 100.0
   },
   "tieredRefundMath": {
