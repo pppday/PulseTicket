@@ -86,30 +86,47 @@ async def purchase_agent_node(state: PurchaseSubState) -> Dict[str, Any]:
             "严禁发起锁座下单，若用户要求锁座下单请友好提示其切换左下角【Agent 模式】执行。"
         )
     elif wants_commit:
-        commit_rule = "用户本轮已明确要求锁座/下单！若已知具体的 session_id 与 seat_ids（见下方共享槽位或刚查出的结果），请直接调用 `propose_create_order`；若尚未拿到 seat_ids，先调 `search_shows` / `recommend_seats` 拿到后再调 `propose_create_order`。"
+        commit_rule = (
+            "用户本轮已明确要求锁座/下单！\n"
+            "- 若共享槽位中已有精确对应的 `session_id` 与 `seat_ids`（注意：若本轮指定了 `preferred_row`/`preferred_col` 且 `seat_ids` 尚未查出，则先调 `recommend_seats(session_id, row_no, col_no, count=1)` 获取真实数据库 `seatIds`），拿到 `seatIds` 后立即在下一步调用 `propose_create_order`；\n"
+            "- 若 `recommend_seats` 返回该指定座位已售/已锁 (`found=False`)，请如实告知用户当前状态并推荐同排相邻余座，切勿强行下单。"
+        )
     else:
         commit_rule = "用户本轮仅咨询演出或请求推荐座位（尚未确认立即下单），请只调用 `search_shows` 和 `recommend_seats` 给出清晰推荐方案，**严禁在本轮调用 `propose_create_order`**！"
 
     sys_text = (
         "你是 PulseTicket 的【选座购票专员 (Purchase Agent)】。\n"
         f"【共享上下文槽位】: {json.dumps(slots, ensure_ascii=False)}\n"
-        f"【最近 3 轮对话】: {state.get('history_summary') or '无'}\n"
+        f"【历史对话参考（仅用于理解指代，回答必须严格紧扣下方当前用户的最新提问，严禁错答上一轮诉求）】:\n{state.get('history_summary') or '无'}\n"
         f"【执行约束】: {commit_rule}\n"
-        "选座工具传参与多档比价策略：\n"
-        "1. 若共享槽位中已确定 `session_id` 且用户是在调整预算/询问“有便宜一点的吗/换其他价位”，**无需重复调用 `search_shows`**，直接调用 `recommend_seats`；\n"
-        "2. 调用 `recommend_seats` 时必须对齐共享槽位：将 `sort_by` 设为 `slots.price_preference`（未指定传 `'best_view'`；若用户问便宜一点/低价/看台必须传 `'lowest_price'`），将 `max_unit_price` 设为 `slots.max_unit_price`；\n"
-        "3. 回复推荐结果时，利用工具返回的 `priceTiers` 顺带说明该场次还有哪些在售票档与余座（例如“另设有 ¥580 优选区 / ¥280 看台区可选”）；若 `found=False` 说明预算内无余座，必须如实告知 `priceTiers` 中当前最低可售档位。\n"
-        "严禁在同一条回复里同时混调只读工具和 `propose_create_order`；若后端服务不可达或无余座，必须如实说明。"
+        "选座工具传参与回复风格规范：\n"
+        "1. 若共享槽位中已确定 `session_id` 且用户是在调整预算/切换体验/指定排座，**无需重复调用 `search_shows`**，直接调用 `recommend_seats`；\n"
+        "2. 调用 `recommend_seats` 时必须严格对齐共享槽位：\n"
+        "   - 若有 `preferred_row` / `preferred_col`（如“第一排2号座位”），务必传入 `row_no` 与 `col_no`（精确查库拿真实 `seatId`）；\n"
+        "   - 将 `sort_by` 设为 `slots.price_preference`（便宜/性价比传 `'lowest_price'`，最佳观看体验/VIP 传 `'highest_price'`，未指定传 `'best_view'`）；\n"
+        "   - 将 `position` 设为 `slots.position_preference`（靠边/过道传 `'side'`，中间/中轴传 `'center'`）；\n"
+        "   - 将 `max_unit_price` 设为 `slots.max_unit_price`（若已清空则不要传旧上限）；\n"
+        "3. 回复风格：直接、自然地回应用户本轮具体诉求（如靠边低价、切换最佳视野或确认具体排座），如果前面轮次已经介绍过该演出的场馆和票价区间，**不要每轮重复背诵一整段演出基础模板**；简明给出本轮新推荐的座位、价格与其余在售票档即可；\n"
+        "4. 严禁在同一条回复里同时混调只读工具和 `propose_create_order`；若后端服务不可达或目标座位已售/无余座，必须如实说明。"
     )
 
-    msgs = list(state.get("sub_messages") or [])
-    if not msgs:
-        msgs = [
-            SystemMessage(content=sys_text),
-            HumanMessage(content=state.get("query") or ""),
-        ]
-    else:
-        msgs = [SystemMessage(content=sys_text)] + [m for m in msgs if not isinstance(m, SystemMessage)]
+    # 【关键 Bug 修复：防止多轮 ReAct 出现“滞后一轮回复”】
+    # 根因回顾：此前 Step 1 返回 {"sub_messages": [resp]} 只保存了 AIMessage(tool_calls)，未保存 HumanMessage(query)；
+    # 导致 Step 2 进入 else 分支重新拼装 msgs 时，列表变成 [SystemMessage, AIMessage, ToolMessage]，
+    # 本轮用户的 HumanMessage 彻底丢失！大模型在写最终回复时只能看到 SystemMessage 里的“历史对话”，
+    # 从而每次都在回答上一轮的问题（慢一拍）。
+    # 修复方案：无论 Step 1 还是 Step 2+，始终把当前最新一轮的 HumanMessage(current_query) 固定锚定在
+    # SystemMessage 之后、工具轨迹 (AIMessage / ToolMessage) 之前，严格保持标准
+    # [System -> User(本轮最新输入) -> Assistant(tool_calls) -> Tool -> ...] 对话拓扑。
+    current_query = state.get("query") or ""
+    tool_history = [
+        m for m in (state.get("sub_messages") or [])
+        if not isinstance(m, (SystemMessage, HumanMessage))
+    ]
+    msgs = [
+        SystemMessage(content=sys_text),
+        HumanMessage(content=current_query),
+    ] + tool_history
 
     emit_thought(
         key=f"pur-reason-{step_count + 1}",
@@ -179,27 +196,54 @@ async def purchase_read_tools_node(state: PurchaseSubState) -> Dict[str, Any]:
 
             effective_args = dict(t_args)
             if t_name == "recommend_seats":
-                if effective_args.get("count") is None and slots.get("seat_count"):
-                    effective_args["count"] = int(slots["seat_count"])
-                if effective_args.get("max_unit_price") is None and slots.get("max_unit_price") is not None:
-                    effective_args["max_unit_price"] = float(slots["max_unit_price"])
-                if not effective_args.get("sort_by") and slots.get("price_preference"):
-                    effective_args["sort_by"] = str(slots["price_preference"])
+                # 【确定性槽位回填】：防止 LLM 漏传靠边偏好、价格偏好、张数或精确排座坐标
+                if effective_args.get("row_no") is None and slots.get("preferred_row") is not None:
+                    effective_args["row_no"] = int(slots["preferred_row"])
+                if effective_args.get("col_no") is None and slots.get("preferred_col") is not None:
+                    effective_args["col_no"] = int(slots["preferred_col"])
+
+                is_exact_lookup = (
+                    effective_args.get("row_no") is not None
+                    and effective_args.get("col_no") is not None
+                )
+                if is_exact_lookup:
+                    # 精确查指定排座（如“第一排2号座”）时，强制按 1 座查询并忽略历史残留的低价上限
+                    effective_args["count"] = 1
+                    effective_args.pop("max_unit_price", None)
+                else:
+                    if effective_args.get("count") is None and slots.get("seat_count"):
+                        effective_args["count"] = int(slots["seat_count"])
+                    if effective_args.get("max_unit_price") is None and slots.get("max_unit_price") is not None:
+                        effective_args["max_unit_price"] = float(slots["max_unit_price"])
+                    # 以本轮路由槽位的价格与位置偏好为准，防止 LLM 受上一轮历史文案惯性继续传错 sort_by/position
+                    if slots.get("price_preference"):
+                        effective_args["sort_by"] = str(slots["price_preference"])
+                    if slots.get("position_preference"):
+                        effective_args["position"] = str(slots["position_preference"])
 
             steps.append({"agent": "purchase_agent", "tool": t_name, "args": effective_args})
 
             if t_name in _PURCHASE_READ_MAP:
                 card_id = f"tool-{t_name}-{t_id}"
-                card_title = (
-                    "查询在售演出与场次库存"
-                    if t_name == "search_shows"
-                    else f"智能推荐场次 #{effective_args.get('session_id')} 最佳连座"
-                )
+                if t_name == "search_shows":
+                    card_title = "查询在售演出与场次库存"
+                    thought_running = "正在查询在售演出目录…"
+                elif effective_args.get("row_no") is not None and effective_args.get("col_no") is not None:
+                    r_v = int(effective_args["row_no"])
+                    c_v = int(effective_args["col_no"])
+                    card_title = f"查询场次 #{effective_args.get('session_id')} {r_v}排{c_v:02d}座实时状态"
+                    thought_running = f"正在核验场次 #{effective_args.get('session_id')} {r_v}排{c_v:02d}座余座与票价…"
+                elif effective_args.get("position") == "side":
+                    card_title = f"智能推荐场次 #{effective_args.get('session_id')} 靠边/过道席位"
+                    thought_running = f"正在计算场次 #{effective_args.get('session_id')} 靠边最优席位…"
+                else:
+                    card_title = f"智能推荐场次 #{effective_args.get('session_id')} 最佳连座"
+                    thought_running = f"正在计算场次 #{effective_args.get('session_id')} 最佳连座方案…"
                 emit_thought(
                     key=f"pur-tool-{t_id}",
                     phase="purchase",
                     agent_label="选座购票子图",
-                    title="正在查询在售演出目录…" if t_name == "search_shows" else f"正在计算场次 #{effective_args.get('session_id')} 中轴线最佳连座…",
+                    title=thought_running,
                     detail=json.dumps(effective_args, ensure_ascii=False),
                     status="running",
                 )
@@ -297,14 +341,28 @@ async def purchase_read_tools_node(state: PurchaseSubState) -> Dict[str, Any]:
                             if rec.get("unitPrice") is not None:
                                 slots["last_unit_price"] = float(rec["unitPrice"])
                             labels_str = "、".join(clean_rec_labels)
+                            is_exact_hit = bool(parsed.get("exactMatch"))
+                            pos_used = parsed.get("position") or effective_args.get("position") or "center"
+                            if is_exact_hit:
+                                score_note = f"精确匹配真实席位 ID {slots['seat_ids']}"
+                                done_title = f"场次 #{slots['session_id']} 已核验指定席位：{labels_str}"
+                                done_summary = f"已核验 {rec.get('zoneName')} {labels_str} 可售（单价 ¥{rec.get('unitPrice')}）"
+                            elif pos_used == "side":
+                                score_note = f"靠边偏移分 {rec.get('sideScore')}"
+                                done_title = f"场次 #{slots['session_id']} 靠边优选：{labels_str}"
+                                done_summary = f"已推荐靠边席位 {rec.get('zoneName')} {labels_str}（单价 ¥{rec.get('unitPrice')} · 合计 ¥{rec.get('totalAmount')}）"
+                            else:
+                                score_note = f"中轴线偏移分 {rec.get('centerScore')}"
+                                done_title = f"场次 #{slots['session_id']} 最优方案：{labels_str}"
+                                done_summary = f"已推荐 {rec.get('zoneName')} {labels_str}（单价 ¥{rec.get('unitPrice')} · 合计 ¥{rec.get('totalAmount')}）"
                             emit_thought(
                                 key=f"pur-tool-{t_id}",
                                 phase="purchase",
                                 agent_label="选座购票子图",
-                                title=f"场次 #{slots['session_id']} 最优方案：{labels_str}",
+                                title=done_title,
                                 detail=(
                                     f"区域：{rec.get('zoneName')} · 单价 ¥{rec.get('unitPrice')} · 合计 ¥{rec.get('totalAmount')} "
-                                    f"（中轴线偏移分 {rec.get('centerScore')}）"
+                                    f"（{score_note}）"
                                 ),
                                 badges=[f"#{slots['session_id']}", f"¥{rec.get('totalAmount')}"],
                                 status="done",
@@ -314,13 +372,15 @@ async def purchase_read_tools_node(state: PurchaseSubState) -> Dict[str, Any]:
                                 tool_name=t_name,
                                 title=card_title,
                                 status="done",
-                                summary=f"已推荐 {rec.get('zoneName')} {labels_str}（单价 ¥{rec.get('unitPrice')} · 合计 ¥{rec.get('totalAmount')}）",
+                                summary=done_summary,
                                 input_data=effective_args,
                                 output_data=parsed,
                             )
                             if mode != "chat" and not slots.get("wants_commit"):
                                 candidates = [rec] + list(parsed.get("alternatives") or [])
                                 sort_pref = parsed.get("sortBy") or effective_args.get("sort_by") or "best_view"
+                                pos_pref = parsed.get("position") or effective_args.get("position") or "center"
+                                is_exact_hit = bool(parsed.get("exactMatch"))
                                 rec_unit = rec.get("unitPrice")
                                 seat_options = []
                                 for idx, opt in enumerate(candidates[:3]):
@@ -333,7 +393,14 @@ async def purchase_read_tools_node(state: PurchaseSubState) -> Dict[str, Any]:
                                     labels_joined = "、".join(opt_labels)
                                     opt_unit = opt.get("unitPrice")
                                     if idx == 0:
-                                        badge_txt = "低价优选" if sort_pref == "lowest_price" else "最佳中轴"
+                                        if is_exact_hit:
+                                            badge_txt = "指定席位"
+                                        elif pos_pref == "side":
+                                            badge_txt = "靠边低价" if sort_pref == "lowest_price" else "靠边优选"
+                                        elif sort_pref == "lowest_price":
+                                            badge_txt = "低价优选"
+                                        else:
+                                            badge_txt = "最佳中轴"
                                     elif opt_unit is not None and opt_unit != rec_unit:
                                         badge_txt = f"¥{int(float(opt_unit))} 档"
                                     else:
@@ -361,7 +428,7 @@ async def purchase_read_tools_node(state: PurchaseSubState) -> Dict[str, Any]:
                                 key=f"pur-tool-{t_id}",
                                 phase="purchase",
                                 agent_label="选座购票子图",
-                                title=f"场次 #{t_args.get('session_id')} 未找到满足预算连座",
+                                title=f"场次 #{effective_args.get('session_id')} 目标席位不可用或预算内余座不足",
                                 detail=msg_fail,
                                 status="warn",
                             )
@@ -371,9 +438,39 @@ async def purchase_read_tools_node(state: PurchaseSubState) -> Dict[str, Any]:
                                 title=card_title,
                                 status="error" if parsed.get("ok") is False else "done",
                                 summary=msg_fail,
-                                input_data=t_args,
+                                input_data=effective_args,
                                 output_data=parsed,
                             )
+                            # 若用户指定了精确坐标但该座已锁/已售，且有同排相邻备选席位，顺手推一张快捷替代选座卡
+                            fallback_alts = list(parsed.get("alternatives") or [])
+                            if mode != "chat" and fallback_alts:
+                                sid_val = int(parsed.get("sessionId") or effective_args.get("session_id") or 0)
+                                alt_options = []
+                                for idx, opt in enumerate(fallback_alts[:3]):
+                                    opt_ids = [int(x) for x in (opt.get("seatIds") or [])]
+                                    z_name = str(opt.get("zoneName") or "").strip()
+                                    opt_labels = [
+                                        _clean_seat_label(z_name, lb)
+                                        for lb in (opt.get("seatLabels") or [])
+                                    ]
+                                    labels_joined = "、".join(opt_labels)
+                                    alt_options.append({
+                                        "id": f"seat-{sid_val}-{'-'.join(str(x) for x in opt_ids)}",
+                                        "label": f"{z_name} · {labels_joined}".strip(" ·"),
+                                        "badge": f"相邻备选 #{idx + 1}",
+                                        "meta": f"单价 ¥{opt.get('unitPrice')} · 合计 ¥{opt.get('totalAmount')}",
+                                        "price": opt.get("totalAmount"),
+                                        "prompt": f"请帮我锁定场次 session_id={sid_val} seat_ids={opt_ids}（{z_name} {labels_joined}）并下单",
+                                    })
+                                if alt_options and sid_val:
+                                    emit_widget(
+                                        widget_id=f"widget-seats-alt-{t_id}",
+                                        widget_type="SEAT_PICKER",
+                                        title=f"目标座位不可用 · 同排相邻余座推荐（{parsed.get('showTitle') or ''}）",
+                                        subtitle=f"{parsed.get('sessionTitle') or ''} · 点击可直接锁定备选席位",
+                                        options=alt_options,
+                                        replace_types=["SHOW_PICKER"],
+                                    )
                     except Exception:
                         emit_tool_card(
                             card_id=card_id,

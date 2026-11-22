@@ -90,7 +90,7 @@ async def order_agent_node(state: OrderSubState) -> Dict[str, Any]:
     sys_text = (
         "你是 PulseTicket 的【订单与售后专员 (Order Agent)】。\n"
         f"【共享上下文槽位】: {json.dumps(slots, ensure_ascii=False)}\n"
-        f"【最近 3 轮对话】: {state.get('history_summary') or '无'}\n"
+        f"【历史对话参考（仅用于理解指代，回答必须严格紧扣下方当前用户的最新提问，严禁错答上一轮诉求）】:\n{state.get('history_summary') or '无'}\n"
         "职责规范：\n"
         "1. 若用户未提供订单号，先调用 `list_my_orders` 查询用户名下订单；\n"
         "2. 若用户仅咨询“某单退票扣多少手续费、能退多少钱”而未明确要求退票，调用 `check_order_refund_detail` 获取代码计算的精确金额，并标注 `[POL-REFUND-001]`，严禁自己心算；\n"
@@ -100,14 +100,18 @@ async def order_agent_node(state: OrderSubState) -> Dict[str, Any]:
         + chat_mode_note
     )
 
-    msgs = list(state.get("sub_messages") or [])
-    if not msgs:
-        msgs = [
-            SystemMessage(content=sys_text),
-            HumanMessage(content=state.get("query") or ""),
-        ]
-    else:
-        msgs = [SystemMessage(content=sys_text)] + [m for m in msgs if not isinstance(m, SystemMessage)]
+    # 【关键 Bug 修复：同步修复订单子图多步 ReAct 丢失当前 HumanMessage 的问题】
+    # 无论 Step 1 还是工具返回后的 Step 2+，始终将当前最新输入 HumanMessage(current_query) 固定在
+    # SystemMessage 与历史工具轨迹之间，确保最终总结紧扣本轮诉求而不滞后一轮。
+    current_query = state.get("query") or ""
+    tool_history = [
+        m for m in (state.get("sub_messages") or [])
+        if not isinstance(m, (SystemMessage, HumanMessage))
+    ]
+    msgs = [
+        SystemMessage(content=sys_text),
+        HumanMessage(content=current_query),
+    ] + tool_history
 
     emit_thought(
         key=f"ord-reason-{step_count + 1}",

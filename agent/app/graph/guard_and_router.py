@@ -37,6 +37,15 @@ _INJECTION_PATTERNS: List[Tuple[re.Pattern, str]] = [
 ]
 
 _CN_NUM_MAP = {"一": 1, "两": 2, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6}
+_CN_SEAT_MAP = {"一": 1, "两": 2, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8}
+
+
+def _parse_cn_or_digit(token: str) -> int:
+    """将中文数字或阿拉伯数字（如 '一' / '02'）统一解析为整数。"""
+    t = str(token or "").strip()
+    if t in _CN_SEAT_MAP:
+        return _CN_SEAT_MAP[t]
+    return int(t)
 
 _POLICY_KW = (
     "退票", "退款", "退单", "退订", "退钱", "全额退", "手续费", "改签", "实名", "身份证", "儿童", "小孩", "身高", "检票", "核验",
@@ -50,6 +59,7 @@ _PURCHASE_KW = (
     "订票", "锁座", "下单", "锁定", "买两张", "买一张", "余票",
     "帮我买", "我想买", "我要买", "便宜", "太贵", "贵了", "低价", "性价比",
     "换个座位", "换座位", "其他价位", "别的价位", "看台",
+    "观看体验", "观演体验", "最佳", "靠边", "过道",
 )
 _CHEAPER_KW = (
     "便宜一点", "便宜点", "更便宜", "便宜些", "便宜的", "最便宜",
@@ -59,8 +69,11 @@ _RELATIVE_CHEAPER_KW = (
     "便宜一点", "便宜点", "更便宜", "便宜些", "太贵", "贵了", "再便宜", "换个低价",
 )
 _HIGHER_KW = (
-    "贵一点", "更贵", "最好的", "最前排", "vip", "内场至尊", "前排", "视野最好",
+    "贵一点", "更贵", "最好的", "最好", "最佳", "观看体验", "观演体验",
+    "视角最好", "视听体验", "最前排", "vip", "内场至尊", "前排", "视野最好",
 )
+_SIDE_KW = ("靠边", "靠过道", "过道", "边上", "边缘", "最边")
+_CENTER_KW = ("中间", "中轴", "正中", "正中间", "居中")
 _ORDER_KW = (
     "我的订单", "历史订单", "查订单", "订单状态", "取消订单", "退掉这单", "退订订单",
     "取消刚才", "刚才那单", "不付了", "申请退票", "申请退款", "退票退款",
@@ -77,7 +90,7 @@ ROUTER_SYSTEM_PROMPT = """你是 PulseTicket 票务主控图的【意图路由�
 可选意图枚举（按需选 1~3 个，若同一句话既问规则又让选座/查演出，必须同时输出多个意图！）：
 - "policy": 询问退改规则、手续费、实名制、儿童身高、场馆地铁交通、禁带物品、寄存、发票/快递/宠物等平台政策与须知
 - "order": 查询用户名下已有订单、核实某笔已有订单能退多少钱、取消未支付订单或为已支付且符合窗口期的订单办理阶梯退票
-- "purchase": 查询在售演出场次、按预算或价位偏好（如“有便宜一点的吗/换低价看台”）推荐连座、或要求对选定座位发起锁座下单
+- "purchase": 查询在售演出场次、按预算/位置偏好（靠边或中间/便宜或最佳体验/指定第几排几座）推荐选座、或要求对选定座位发起锁座下单
 - "chitchat": 纯打招呼、感谢、闲聊（不涉及任何规则、演出、选座或订单）
 
 输出 JSON 格式示例：
@@ -90,6 +103,7 @@ ROUTER_SYSTEM_PROMPT = """你是 PulseTicket 票务主控图的【意图路由�
     "seat_count": 2,
     "max_unit_price": 700,
     "price_preference": "lowest_price",
+    "position_preference": "side",
     "seat_ids": null,
     "order_no": null,
     "wants_commit": false
@@ -97,8 +111,10 @@ ROUTER_SYSTEM_PROMPT = """你是 PulseTicket 票务主控图的【意图路由�
 }
 注意：
 - `seat_count`: 仅在用户本轮明确提出新张数时填写，未提及时返回 null 以继承上下文已有张数。
-- `price_preference`: 用户要低价/便宜/性价比/看台传 `"lowest_price"`，要 VIP/前排/视野最好传 `"highest_price"`，默认 `"best_view"`（未提及可传 null）。
-- `wants_commit` 仅在用户明确要求“现在帮我锁座/下单/买下选定座位”时为 true；如果只是“帮我推荐/有便宜一点的吗/看看座位”则为 false！"""
+- `price_preference`: 用户要低价/便宜/性价比/看台传 `"lowest_price"`，要 VIP/前排/最佳观看体验传 `"highest_price"`，默认 `"best_view"`（未提及可传 null）。
+- `position_preference`: 用户说靠边/过道传 `"side"`，说中间/中轴传 `"center"`，未提及传 null。
+- `seat_ids`: 仅在用户明确给出数据库 seat_ids 列表时填写；绝不可把“第一排2号座位”中的“2号”误填成 `seat_ids=[2]`！
+- `wants_commit` 仅在用户明确要求“现在帮我锁座/下单/买下选定座位/我要第X排Y号座位”时为 true；如果只是“帮我推荐/有便宜一点的吗/看看座位”则为 false！"""
 
 
 def detect_prompt_injection(text: str) -> Optional[str]:
@@ -144,23 +160,27 @@ def summarize_and_trim_history(
 
 
 def _reset_stale_show_slots(slots: SharedSlots, keep_budget: bool = False) -> None:
-    """当用户切换到另一部新演出时，清理上一部演出残留的场次、座位与推荐单价槽位。"""
-    for k in ("session_id", "seat_ids", "seat_labels", "last_unit_price"):
+    """当用户切换到另一部新演出时，清理上一部演出残留的场次、座位、排座坐标、位置与推荐单价槽位。"""
+    for k in ("session_id", "seat_ids", "seat_labels", "last_unit_price", "preferred_row", "preferred_col"):
         slots.pop(k, None)
     if not keep_budget:
         slots.pop("max_unit_price", None)
         slots.pop("price_preference", None)
+        slots.pop("position_preference", None)
 
 
 def extract_deterministic_signals(query: str, prev_slots: Optional[SharedSlots] = None) -> Tuple[List[str], SharedSlots]:
     """
     【确定性正则槽位抽取与意图兜底】：
-    设计思路：把订单号、场次 ID、座位 ID、预算数字、价格偏好（如“便宜一点”）用确定性代码提前抽准，
-    既给 LLM Router 做先验校准（防模型抽丢），也在离线单测或模型波动时直接兜底路由。
+    设计思路：把订单号、场次 ID、精确排座坐标（第X排Y号）、靠边/中轴偏好、预算数字与价格偏好用确定性代码提前抽准，
+    既给 LLM Router 做先验校准（防止大模型把“第一排2号座位”误当成数据库主键 seat_id=2），也在离线单测或模型波动时兜底。
     """
     q = (query or "").strip()
     q_lower = q.lower()
     slots: SharedSlots = dict(prev_slots or {})
+    # 排号/座号是单轮显式坐标约束，默认每轮重置，避免上一轮查过“第一排2号座”后锁死后续推荐
+    slots.pop("preferred_row", None)
+    slots.pop("preferred_col", None)
 
     # 1. 抽取订单号 (如 TK202611160001)
     m_order = re.search(r"\b(TK\d{8,20}[A-Z0-9]*)\b", q, re.IGNORECASE)
@@ -187,18 +207,41 @@ def extract_deterministic_signals(query: str, prev_slots: Optional[SharedSlots] 
     if m_price:
         slots["max_unit_price"] = float(m_price.group(1))
 
-    # 5. 抽取明确指定的座位 ID 列表 (支持 seat_ids=[20] / seat_ids=[20, 21] 与 "20和21号座位" / "20号座位")
+    # 5. 优先识别“第X排Y号座位 / 第X排”物理坐标，再识别显式数据库 seat_ids
+    # 关键修复：若先跑 `(\d+)号座位`，会把“第一排2号座位”误解析成数据库主键 seat_ids=[2]（属于完全不同的演出场次）！
+    m_row_col = re.search(
+        r"第?\s*([1-6一二三四五六])\s*排\s*第?\s*0?([1-8一二三四五六七八])\s*(?:号座位|号座|座位|号|座)",
+        q,
+    )
+    m_row_only = None if m_row_col else re.search(r"第?\s*([1-6一二三四五六])\s*排", q)
     m_seat_list = re.search(r"seat_ids\s*=\s*\[([\d,\s]+)\]", q, re.IGNORECASE)
     m_seat_ids = None
+
     if m_seat_list:
         parsed_ids = sorted({int(x.strip()) for x in m_seat_list.group(1).split(",") if x.strip().isdigit()})
         if parsed_ids:
             slots["seat_ids"] = parsed_ids
+    elif m_row_col:
+        slots["preferred_row"] = _parse_cn_or_digit(m_row_col.group(1))
+        slots["preferred_col"] = _parse_cn_or_digit(m_row_col.group(2))
+        if not (m_cnt_digit or m_cnt_cn):
+            slots["seat_count"] = 1
+        # 用户明确点名某排某座时，清空上一轮推荐席位与残留偏好/价格上限，确保直接按坐标精确查库
+        for stale_k in ("seat_ids", "seat_labels", "position_preference", "price_preference"):
+            slots.pop(stale_k, None)
+        if not m_price:
+            slots.pop("max_unit_price", None)
     else:
+        if m_row_only:
+            slots["preferred_row"] = _parse_cn_or_digit(m_row_only.group(1))
+            slots.pop("seat_ids", None)
+            slots.pop("seat_labels", None)
+            if not m_price:
+                slots.pop("max_unit_price", None)
         m_seat_ids = re.search(r"(\d{1,3})\s*(?:和|、|,|与)\s*(\d{1,3})\s*号?座位", q)
         if m_seat_ids:
             slots["seat_ids"] = sorted({int(m_seat_ids.group(1)), int(m_seat_ids.group(2))})
-        else:
+        elif not m_row_only:
             m_single_seat = re.search(r"(?<!\d)(\d{1,3})\s*号座位", q)
             if m_single_seat:
                 slots["seat_ids"] = [int(m_single_seat.group(1))]
@@ -212,26 +255,52 @@ def extract_deterministic_signals(query: str, prev_slots: Optional[SharedSlots] 
             slots["show_keyword"] = kw
             break
 
-    # 7. 价格偏好感知：解决“有便宜一点的吗 / 换个低价档 / 最前排 VIP”多轮衔接
-    explicit_explicit_seats = bool(m_seat_list or m_seat_ids)
-    if any(k in q for k in _CHEAPER_KW):
+    # 7. 价格与横向位置偏好感知：
+    #    - “靠边/过道” -> position_preference="side"（优先 01/08 座）
+    #    - “便宜一点/性价比” -> price_preference="lowest_price"
+    #    - “最佳观看体验/前排 VIP” -> price_preference="highest_price"，同时清掉上一轮残留的 max_unit_price 与靠边偏好
+    explicit_db_seats = bool(m_seat_list or m_seat_ids)
+    has_side_kw = any(k in q for k in _SIDE_KW)
+    has_center_kw = any(k in q for k in _CENTER_KW)
+    if has_side_kw and not m_row_col:
+        slots["position_preference"] = "side"
+        if not explicit_db_seats:
+            slots.pop("seat_ids", None)
+            slots.pop("seat_labels", None)
+    elif has_center_kw and not m_row_col:
+        slots["position_preference"] = "center"
+        if not explicit_db_seats:
+            slots.pop("seat_ids", None)
+            slots.pop("seat_labels", None)
+
+    if any(k in q for k in _CHEAPER_KW) and not m_row_col:
         slots["price_preference"] = "lowest_price"
-        if not explicit_explicit_seats:
+        if not explicit_db_seats:
             slots.pop("seat_ids", None)
             slots.pop("seat_labels", None)
         if not m_price and any(k in q for k in _RELATIVE_CHEAPER_KW) and slots.get("last_unit_price"):
             # 基于上轮推荐价（如 ¥880）自动设置严格更低的单价上限（¥879.0）
             slots["max_unit_price"] = round(max(1.0, float(slots["last_unit_price"]) - 1.0), 2)
-    elif any(k in q_lower for k in _HIGHER_KW):
+    elif any(k in q_lower for k in _HIGHER_KW) and not m_row_col:
         slots["price_preference"] = "highest_price"
-        if not explicit_explicit_seats:
+        if not explicit_db_seats:
             slots.pop("seat_ids", None)
             slots.pop("seat_labels", None)
         if not m_price:
             slots.pop("max_unit_price", None)
+        if not has_side_kw:
+            # 从“靠边便宜”切换到“最佳观看体验”时显式重置为中轴视野，防止大模型受上轮历史影响继续传 position="side"
+            slots["position_preference"] = "center"
 
     # 8. 判断本轮是否明确发起锁座下单
     wants_commit = any(k in q for k in _COMMIT_KW)
+    if (
+        m_row_col
+        and re.search(r"(我要|我想买|帮我买|买|订|锁|选|来|要)", q)
+        and not any(k in q for k in ("吗", "怎么样", "有没有", "贵不贵", "多少钱", "空着", "还有", "推荐"))
+    ):
+        # 用户点名精确坐标并表态购买（如“我要第一排2号座位”），查出真实 seatId 后直接弹核价确认卡片
+        wants_commit = True
     if "如果" in q and ("推荐" in q or "选两张" in q or "选座" in q) and "下单" not in q:
         wants_commit = False
     slots["wants_commit"] = wants_commit
@@ -242,7 +311,16 @@ def extract_deterministic_signals(query: str, prev_slots: Optional[SharedSlots] 
         intents.append("policy")
     if m_order or any(k in q for k in _ORDER_KW):
         intents.append("order")
-    if wants_commit or m_sess or m_seat_ids or any(k in q for k in _PURCHASE_KW):
+    if (
+        wants_commit
+        or m_sess
+        or m_seat_ids
+        or m_row_col
+        or m_row_only
+        or has_side_kw
+        or has_center_kw
+        or any(k in q for k in _PURCHASE_KW)
+    ):
         # 避免“退票/取消订单”误判成买票
         if not ("取消订单" in q and not any(pk in q for pk in ("推荐", "买", "选座", "锁座"))):
             intents.append("purchase")
@@ -396,25 +474,53 @@ async def intent_router_node(state: MainGraphState) -> Dict[str, Any]:
                 llm_kw = str(llm_slots.get("show_keyword") or "").strip()
                 if llm_kw and prev_kw and llm_kw.lower() != prev_kw and not merged_slots.get("seat_ids"):
                     _reset_stale_show_slots(merged_slots)
+
+                has_exact_row_col = (
+                    merged_slots.get("preferred_row") is not None
+                    and merged_slots.get("preferred_col") is not None
+                )
+                rule_pref_hit = any(k in query for k in _CHEAPER_KW) or any(k in query.lower() for k in _HIGHER_KW)
+                rule_pos_hit = any(k in query for k in _SIDE_KW) or any(k in query for k in _CENTER_KW)
+
                 for k in ("show_keyword", "category", "session_id", "seat_count", "max_unit_price", "order_no"):
                     val = llm_slots.get(k)
                     if val is None or val == "":
                         continue
-                    if (
-                        k == "seat_count"
-                        and prev_slots.get("seat_count") is not None
-                        and not re.search(r"[1-6一两二三四五六]|张|个人|位", query)
-                    ):
-                        continue
+                    if k == "seat_count":
+                        # 精确点名某排某座且未说“几张”时锁定为 1 张，防止把“2号座位”的 2 误当作 2 张
+                        if has_exact_row_col and not re.search(r"[1-6一两二三四五六]\s*张", query):
+                            continue
+                        if prev_slots.get("seat_count") is not None and not re.search(r"[1-6一两二三四五六]|张|个人|位", query):
+                            continue
+                    if k == "max_unit_price":
+                        # 防止模型从历史对话中把上一轮已清除的低价预算（如 280）带回到“最佳观看体验/第一排2号座”
+                        if (has_exact_row_col or any(hk in query.lower() for hk in _HIGHER_KW)) and not re.search(r"\d{2,4}\s*(?:元|块)", query):
+                            continue
+                        if not re.search(r"\d", query):
+                            continue
                     merged_slots[k] = val
-                rule_pref_hit = any(k in query for k in _CHEAPER_KW) or any(k in query.lower() for k in _HIGHER_KW)
+
                 llm_pref = llm_slots.get("price_preference")
-                if not rule_pref_hit and llm_pref in ("best_view", "lowest_price", "highest_price"):
+                if not rule_pref_hit and not has_exact_row_col and llm_pref in ("best_view", "lowest_price", "highest_price"):
                     merged_slots["price_preference"] = llm_pref
-                if isinstance(llm_slots.get("seat_ids"), list) and llm_slots["seat_ids"]:
+
+                llm_pos = llm_slots.get("position_preference")
+                if not rule_pos_hit and not has_exact_row_col and not any(hk in query.lower() for hk in _HIGHER_KW):
+                    if llm_pos in ("center", "side"):
+                        merged_slots["position_preference"] = llm_pos
+
+                # 仅在用户确实指定了数据库 seat_ids（而非“第一排2号座”物理坐标或换价位重选）时采纳 LLM 返回的 seat_ids
+                if (
+                    isinstance(llm_slots.get("seat_ids"), list)
+                    and llm_slots["seat_ids"]
+                    and not merged_slots.get("preferred_row")
+                    and not rule_pref_hit
+                    and not rule_pos_hit
+                    and re.search(r"seat_ids\s*=|\d+\s*(?:和|、|,|与)\s*\d+\s*号?座位", query)
+                ):
                     merged_slots["seat_ids"] = [int(x) for x in llm_slots["seat_ids"]]
                 if isinstance(llm_slots.get("wants_commit"), bool):
-                    merged_slots["wants_commit"] = merged_slots["wants_commit"] or bool(merged_slots.get("wants_commit"))
+                    merged_slots["wants_commit"] = bool(merged_slots.get("wants_commit"))
     except Exception:
         # 离线无 Key 评测或模型波动时平滑回退到确定性路由结果
         final_intents = rule_intents
@@ -450,7 +556,15 @@ async def intent_router_node(state: MainGraphState) -> Dict[str, Any]:
     if merged_slots.get("price_preference") == "lowest_price":
         slot_notes.append("偏好低价优先")
     elif merged_slots.get("price_preference") == "highest_price":
-        slot_notes.append("偏好 VIP 优先")
+        slot_notes.append("偏好 VIP/最佳体验")
+    if merged_slots.get("position_preference") == "side":
+        slot_notes.append("偏好靠边/过道")
+    elif merged_slots.get("position_preference") == "center":
+        slot_notes.append("偏好中轴视野")
+    if merged_slots.get("preferred_row") is not None and merged_slots.get("preferred_col") is not None:
+        slot_notes.append(f"指定 {merged_slots['preferred_row']}排{int(merged_slots['preferred_col']):02d}座")
+    elif merged_slots.get("preferred_row") is not None:
+        slot_notes.append(f"指定第 {merged_slots['preferred_row']} 排")
     if merged_slots.get("seat_ids"):
         slot_notes.append(f"席位 ID {merged_slots['seat_ids']}")
     if merged_slots.get("order_no"):

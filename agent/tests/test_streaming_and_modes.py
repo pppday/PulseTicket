@@ -448,6 +448,145 @@ class TestStreamingAndModes(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(float(o["price"]) < 880.0 for o in w2["options"]), f"Turn 2 still had >=880 option: {w2['options']}")
         self.assertEqual(w2["options"][0]["badge"], "低价优选")
 
+    async def test_9_no_one_turn_lag_side_seat_and_exact_row_col_lookup(self):
+        """
+        【回归测试：三大核心体验修复】
+        1) purchase_agent_node & order_agent_node 在工具返回后的 Step 2 中，必须保留本轮 HumanMessage(current_query)，
+           根治“每次都回答上一轮问题（滞后一轮）”的严重 Bug；
+        2) recommend_seats 支持 position='side'（靠边优先 01/08 座）与精确 row_no/col_no 查真实 seatId；
+        3) extract_deterministic_signals 正确识别“最佳观看体验”清除残留低价上限，并将“我要第一排2号座位”解析为
+           (preferred_row=1, preferred_col=2, wants_commit=True) 而绝不误解析成数据库主键 seat_ids=[2]。
+        """
+        from langchain_core.messages import HumanMessage, ToolMessage
+        import app.graph.subgraphs.order as ord_mod
+
+        # 1) 验证 purchase_agent_node Step 2（已有 tool_calls + ToolMessage）仍锚定本轮 HumanMessage
+        pur_captured = []
+
+        class CaptureAstreamLLM:
+            def __init__(self, bucket):
+                self._bucket = bucket
+
+            async def astream(self, msgs):
+                self._bucket.append(list(msgs))
+                yield AIMessageChunk(content="已紧扣当前提问作答。")
+
+            async def ainvoke(self, msgs):
+                self._bucket.append(list(msgs))
+                return AIMessage(content="已紧扣当前提问作答。")
+
+        pur_state = {
+            "query": "我想要最佳的观看体验呢",
+            "history_summary": "用户: 帮我买一张靠边便宜性价比高的白雪公主的票\n助手: 推荐 5排01座 ¥280",
+            "mode": "agent",
+            "slots": {"session_id": 403, "seat_count": 1, "price_preference": "highest_price"},
+            "step_count": 1,
+            "sub_messages": [
+                AIMessage(content="", tool_calls=[{"id": "tc1", "name": "recommend_seats", "args": {"session_id": 403, "count": 1}, "type": "tool_call"}]),
+                ToolMessage(content='{"found": true}', name="recommend_seats", tool_call_id="tc1"),
+            ],
+        }
+        with patch.object(pur_mod, "_get_purchase_llm", return_value=CaptureAstreamLLM(pur_captured)):
+            await pur_mod.purchase_agent_node(pur_state)
+        self.assertEqual(len(pur_captured), 1)
+        pur_humans = [m.content for m in pur_captured[0] if isinstance(m, HumanMessage)]
+        self.assertEqual(pur_humans, ["我想要最佳的观看体验呢"])
+
+        # 同步验证 order_agent_node Step 2 也保留本轮 HumanMessage
+        ord_captured = []
+        ord_state = {
+            "query": "帮我查一下最新订单能退多少钱",
+            "history_summary": "用户: 查看我的订单\n助手: 共 2 笔订单",
+            "mode": "agent",
+            "slots": {"order_no": "TK202611220001"},
+            "step_count": 1,
+            "sub_messages": [
+                AIMessage(content="", tool_calls=[{"id": "tc_o1", "name": "list_my_orders", "args": {}, "type": "tool_call"}]),
+                ToolMessage(content='{"ok": true, "orders": []}', name="list_my_orders", tool_call_id="tc_o1"),
+            ],
+        }
+        with patch.object(ord_mod, "_get_order_llm", return_value=CaptureAstreamLLM(ord_captured)):
+            await ord_mod.order_agent_node(ord_state)
+        self.assertEqual(len(ord_captured), 1)
+        ord_humans = [m.content for m in ord_captured[0] if isinstance(m, HumanMessage)]
+        self.assertEqual(ord_humans, ["帮我查一下最新订单能退多少钱"])
+
+        # 2) 验证槽位信号抽取：靠边便宜 -> 最佳观看体验 -> 我要第一排2号座位
+        _, s1 = gr_mod.extract_deterministic_signals("帮我买一张靠边便宜性价比高的白雪公主的票", {})
+        self.assertEqual(s1.get("price_preference"), "lowest_price")
+        self.assertEqual(s1.get("position_preference"), "side")
+        self.assertEqual(s1.get("seat_count"), 1)
+        self.assertFalse(s1.get("wants_commit"))
+
+        s1["session_id"] = 403
+        s1["max_unit_price"] = 280.0
+        _, s2 = gr_mod.extract_deterministic_signals("我想要最佳的观看体验呢", s1)
+        self.assertEqual(s2.get("price_preference"), "highest_price")
+        self.assertIsNone(s2.get("max_unit_price"))
+        self.assertEqual(s2.get("position_preference"), "center")
+
+        _, s3 = gr_mod.extract_deterministic_signals("我要第一排2号座位", s2)
+        self.assertEqual(s3.get("preferred_row"), 1)
+        self.assertEqual(s3.get("preferred_col"), 2)
+        self.assertEqual(s3.get("seat_count"), 1)
+        self.assertTrue(s3.get("wants_commit"))
+        self.assertIsNone(s3.get("seat_ids"))  # 严禁误解析为数据库主键 [2]
+
+        # 3) 验证 recommend_seats：靠边低价返回 01/08 座；精确坐标 (row=1, col=2) 返回真实 seatId=290
+        seats_403 = []
+        sid = 289
+        for r in range(1, 7):
+            zone = "内场全息至尊区" if r <= 2 else ("中轴声场优选区" if r <= 4 else "全景看台标准区")
+            price = 880.0 if r <= 2 else (580.0 if r <= 4 else 280.0)
+            for c in range(1, 9):
+                seats_403.append({
+                    "id": sid,
+                    "sessionId": 403,
+                    "rowNo": r,
+                    "colNo": c,
+                    "seatLabel": f"{r}排{c:02d}座",
+                    "zoneName": zone,
+                    "price": price,
+                    "status": "AVAILABLE",
+                })
+                sid += 1
+        seat_payload_403 = {
+            "code": 200,
+            "data": {
+                "show": {"id": 6, "title": "白雪公主", "status": "ON_SALE"},
+                "session": {"id": 403, "sessionTitle": "12月24日 周四 19:30 平安夜黄金场"},
+                "seats": seats_403,
+            },
+        }
+        tok = tools_mod.current_user_ctx.set({"user_id": 1001, "username": "zhaolan", "role": "USER"})
+        try:
+            with patch.object(tools_mod.httpx.AsyncClient, "get", new=AsyncMock(return_value=FakeHttpResp(200, seat_payload_403))):
+                raw_side = await tools_mod.recommend_seats.ainvoke({
+                    "session_id": 403,
+                    "count": 1,
+                    "sort_by": "lowest_price",
+                    "position": "side",
+                })
+                parsed_side = json.loads(raw_side)
+                self.assertTrue(parsed_side["found"])
+                self.assertEqual(parsed_side["recommended"]["unitPrice"], 280.0)
+                self.assertIn(parsed_side["recommended"]["seatLabels"][0], ("5排01座", "5排08座"))
+
+                raw_exact = await tools_mod.recommend_seats.ainvoke({
+                    "session_id": 403,
+                    "count": 1,
+                    "row_no": 1,
+                    "col_no": 2,
+                })
+                parsed_exact = json.loads(raw_exact)
+                self.assertTrue(parsed_exact["found"])
+                self.assertTrue(parsed_exact["exactMatch"])
+                self.assertEqual(parsed_exact["recommended"]["seatIds"], [290])
+                self.assertEqual(parsed_exact["recommended"]["seatLabels"], ["1排02座"])
+                self.assertEqual(parsed_exact["recommended"]["unitPrice"], 880.0)
+        finally:
+            tools_mod.current_user_ctx.reset(tok)
+
 
 if __name__ == "__main__":
     unittest.main()

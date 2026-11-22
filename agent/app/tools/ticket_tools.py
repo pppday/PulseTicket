@@ -628,15 +628,21 @@ async def recommend_seats(
     count: int = 2,
     max_unit_price: Optional[float] = None,
     sort_by: str = "best_view",
+    position: str = "center",
+    row_no: Optional[int] = None,
+    col_no: Optional[int] = None,
 ) -> str:
     """
-    【Java show-service 智能连座与多票档推荐工具】
-    根据场次 ID (session_id)、需要购买的张数 (count)、单张最高预算 (max_unit_price) 和排序偏好 (sort_by)，
-    实时拉取 Java 48 座矩阵库存，自动过滤已售/已锁座位并在同一排内计算最佳连座组合，
-    同时始终返回该场次全部在售票档汇总 (`priceTiers`)，便于向用户提供更便宜或更靠前选项：
-    - `sort_by="best_view"`: 优先中轴线视野最佳前排（默认）
-    - `sort_by="lowest_price"`: 优先最低价格档位（当用户问“便宜一点 / 低价 / 性价比 / 看台”时必须传此值）
-    - `sort_by="highest_price"`: 优先最高 VIP 票档
+    【Java show-service 智能连座、靠边选座、精确排座定位与多票档推荐工具】
+    根据场次 ID (session_id)、张数 (count)、单张最高预算 (max_unit_price)、排序偏好 (sort_by)、
+    横向位置偏好 (position) 及可选精确排号/座号 (row_no / col_no)，实时拉取 Java 48 座矩阵库存并计算方案：
+    - `sort_by="best_view"`: 优先视野最佳前排（默认）
+    - `sort_by="lowest_price"`: 优先最低价格档位（“便宜一点 / 低价 / 性价比 / 看台”）
+    - `sort_by="highest_price"`: 优先最高 VIP 票档（“最佳观看体验 / 最前排 / VIP”）
+    - `position="center"`: 优先中轴线（第 4/5 列，默认）
+    - `position="side"`: 优先靠边/过道（第 1 列或最末列，如 01座/08座；当用户说“靠边/过道”时必须传此值）
+    - `row_no` / `col_no`: 当用户明确指定排号或精确座位（如“第一排2号座位” -> `row_no=1, col_no=2`）时，
+      直接定位真实数据库 `seatId` 并校验是否可售（绝不把“2号座位”误当成 MySQL 主键 `id=2`）。
     """
     count = max(1, min(6, int(count)))
     norm_sort = str(sort_by or "best_view").strip().lower()
@@ -646,6 +652,15 @@ async def recommend_seats(
         norm_sort = "highest_price"
     else:
         norm_sort = "best_view"
+
+    norm_pos = str(position or "center").strip().lower()
+    if norm_pos in ("side", "aisle", "edge", "靠边", "过道", "边上"):
+        norm_pos = "side"
+    else:
+        norm_pos = "center"
+
+    target_row = int(row_no) if row_no is not None else None
+    target_col = int(col_no) if col_no is not None else None
 
     seats: List[Dict[str, Any]] = []
     show_title = ""
@@ -688,8 +703,11 @@ async def recommend_seats(
         seats = mock_map["seats"]
 
     all_available = [s for s in seats if s.get("status") == "AVAILABLE"]
+    # 动态推算本场次每排最大列号与中轴线坐标（标准 6×8 矩阵中 max_col=8、center_axis=4.5）
+    max_col = max((int(s.get("colNo") or 8) for s in seats), default=8)
+    center_axis = (1.0 + max_col) / 2.0
 
-    def _build_contiguous_candidates(seat_pool: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _build_contiguous_candidates(seat_pool: List[Dict[str, Any]], win_size: int) -> List[Dict[str, Any]]:
         rows_map: Dict[int, List[Dict[str, Any]]] = {}
         for s in seat_pool:
             rows_map.setdefault(int(s["rowNo"]), []).append(s)
@@ -697,24 +715,33 @@ async def recommend_seats(
         out: List[Dict[str, Any]] = []
         for r_no, r_seats in rows_map.items():
             r_seats.sort(key=lambda x: int(x["colNo"]))
-            for i in range(len(r_seats) - count + 1):
-                window = r_seats[i : i + count]
-                if int(window[-1]["colNo"]) - int(window[0]["colNo"]) == count - 1:
-                    center_dist = sum(abs(float(x["colNo"]) - 4.5) for x in window) / count
+            for i in range(len(r_seats) - win_size + 1):
+                window = r_seats[i : i + win_size]
+                if int(window[-1]["colNo"]) - int(window[0]["colNo"]) == win_size - 1:
+                    # centerScore 越小越靠中轴（如 4/5 座为 0.5）；sideScore 越小越靠两侧过道（如 1/8 座为 0.0）
+                    center_dist = sum(abs(float(x["colNo"]) - center_axis) for x in window) / win_size
+                    side_dist = sum(
+                        min(abs(int(x["colNo"]) - 1), abs(max_col - int(x["colNo"])))
+                        for x in window
+                    ) / win_size
                     total_price = sum(float(x["price"]) for x in window)
                     z_name = str(window[0].get("zoneName") or "").strip()
                     out.append({
                         "rowNo": r_no,
+                        "colNos": [int(x["colNo"]) for x in window],
                         "zoneName": z_name,
                         "seatIds": [int(x["id"]) for x in window],
                         "seatLabels": [_clean_seat_label(z_name, x.get("seatLabel")) for x in window],
                         "unitPrice": round(float(window[0]["price"]), 2),
                         "totalAmount": round(total_price, 2),
                         "centerScore": round(center_dist, 2),
+                        "sideScore": round(side_dist, 2),
                     })
         return out
 
-    # 始终统计该场次全部可用票档汇总，避免大模型“盲人摸象”不知道还有更便宜档位
+    pos_metric = "sideScore" if norm_pos == "side" else "centerScore"
+
+    # 始终统计该场次全部可用票档汇总，避免大模型“盲人摸象”不知道还有哪些档位
     tier_buckets: Dict[tuple, List[Dict[str, Any]]] = {}
     for s in all_available:
         key = (round(float(s.get("price", 0)), 2), str(s.get("zoneName") or "").strip())
@@ -722,8 +749,8 @@ async def recommend_seats(
 
     price_tiers: List[Dict[str, Any]] = []
     for (tier_price, tier_zone), tier_seats in sorted(tier_buckets.items(), key=lambda kv: kv[0][0]):
-        tier_cands = _build_contiguous_candidates(tier_seats)
-        tier_cands.sort(key=lambda x: (x["centerScore"], x["rowNo"]))
+        tier_cands = _build_contiguous_candidates(tier_seats, count)
+        tier_cands.sort(key=lambda x: (x[pos_metric], x["rowNo"]))
         price_tiers.append({
             "unitPrice": tier_price,
             "zoneName": tier_zone,
@@ -731,9 +758,86 @@ async def recommend_seats(
             "bestOption": tier_cands[0] if tier_cands else None,
         })
 
+    # ==================== 分支 A：用户明确指定了精确座位（row_no + col_no） ====================
+    # 例如“我要第一排2号座位”：直接按 (rowNo, colNo) 在真实座位矩阵中查出唯一数据库 seatId，
+    # 不受上一轮残留预算上限 max_unit_price 拦截，若该座已被锁/已售则如实播报并提供同排相邻备选。
+    if target_row is not None and target_col is not None:
+        exact_seat = next(
+            (s for s in seats if int(s.get("rowNo", -1)) == target_row and int(s.get("colNo", -1)) == target_col),
+            None,
+        )
+        same_row_avail = [s for s in all_available if int(s.get("rowNo", -1)) == target_row]
+        nearby_cands = _build_contiguous_candidates(same_row_avail, 1)
+        nearby_cands.sort(key=lambda x: (abs(x["colNos"][0] - target_col), x["centerScore"]))
+
+        if exact_seat is None:
+            return json.dumps({
+                "found": False,
+                "exactMatch": False,
+                "isMock": not from_java,
+                "source": "Java show-service(:8202)" if from_java else "本地 DEV_MOCK 座位矩阵",
+                "showTitle": show_title,
+                "sessionId": session_id,
+                "sessionTitle": session_title,
+                "requestedSeat": f"{target_row}排{target_col:02d}座",
+                "priceTiers": price_tiers,
+                "alternatives": nearby_cands[:2],
+                "message": f"场次 #{session_id} 不存在 {target_row}排{target_col:02d}座（本场次共 1~6 排、每排 1~{max_col} 座）。",
+            }, ensure_ascii=False, indent=2)
+
+        z_name = str(exact_seat.get("zoneName") or "").strip()
+        clean_lb = _clean_seat_label(z_name, exact_seat.get("seatLabel"))
+        exact_status = str(exact_seat.get("status") or "UNKNOWN").upper()
+        if exact_status != "AVAILABLE":
+            status_cn = "已被他人锁定（待支付）" if exact_status == "LOCKED" else "已售出"
+            return json.dumps({
+                "found": False,
+                "exactMatch": False,
+                "isMock": not from_java,
+                "source": "Java show-service(:8202)" if from_java else "本地 DEV_MOCK 座位矩阵",
+                "showTitle": show_title,
+                "sessionId": session_id,
+                "sessionTitle": session_title,
+                "requestedSeat": clean_lb,
+                "requestedSeatId": int(exact_seat["id"]),
+                "requestedSeatStatus": exact_status,
+                "priceTiers": price_tiers,
+                "alternatives": nearby_cands[:2],
+                "message": f"场次 #{session_id} 的 {z_name} {clean_lb} 当前{status_cn}（status={exact_status}），暂无法锁定。",
+            }, ensure_ascii=False, indent=2)
+
+        exact_cand = {
+            "rowNo": target_row,
+            "colNos": [target_col],
+            "zoneName": z_name,
+            "seatIds": [int(exact_seat["id"])],
+            "seatLabels": [clean_lb],
+            "unitPrice": round(float(exact_seat["price"]), 2),
+            "totalAmount": round(float(exact_seat["price"]), 2),
+            "centerScore": round(abs(float(target_col) - center_axis), 2),
+            "sideScore": round(float(min(abs(target_col - 1), abs(max_col - target_col))), 2),
+        }
+        alts = [c for c in nearby_cands if c["seatIds"] != exact_cand["seatIds"]][:2]
+        return json.dumps({
+            "found": True,
+            "exactMatch": True,
+            "isMock": not from_java,
+            "source": "Java show-service(:8202)" if from_java else "本地 DEV_MOCK 座位矩阵",
+            "showTitle": show_title,
+            "sessionId": session_id,
+            "sessionTitle": session_title,
+            "sortBy": norm_sort,
+            "position": norm_pos,
+            "priceTiers": price_tiers,
+            "recommended": exact_cand,
+            "alternatives": alts,
+        }, ensure_ascii=False, indent=2)
+
+    # ==================== 分支 B：按指定排号 / 预算 / 靠边或中轴偏好智能推荐 ====================
     available = [
         s for s in all_available
-        if max_unit_price is None or float(s.get("price", 0)) <= float(max_unit_price)
+        if (max_unit_price is None or float(s.get("price", 0)) <= float(max_unit_price))
+        and (target_row is None or int(s.get("rowNo", -1)) == target_row)
     ]
 
     if len(available) < count:
@@ -742,23 +846,29 @@ async def recommend_seats(
             if price_tiers
             else "当前场次暂无可售余座。"
         )
+        cond_desc = (
+            f"第 {target_row} 排"
+            if target_row is not None
+            else f"预算（<= ¥{max_unit_price}）"
+        )
         return json.dumps({
             "found": False,
             "showTitle": show_title,
             "sessionId": session_id,
             "sessionTitle": session_title,
             "sortBy": norm_sort,
+            "position": norm_pos,
             "priceTiers": price_tiers,
-            "message": f"当前场次满足预算（<= ¥{max_unit_price}）的空余座位不足 {count} 个。{lowest_hint}",
+            "message": f"当前场次满足{cond_desc}的空余座位不足 {count} 个。{lowest_hint}",
         }, ensure_ascii=False, indent=2)
 
-    candidates = _build_contiguous_candidates(available)
+    candidates = _build_contiguous_candidates(available, count)
     if norm_sort == "lowest_price":
-        candidates.sort(key=lambda x: (x["unitPrice"], x["centerScore"], x["rowNo"]))
+        candidates.sort(key=lambda x: (x["unitPrice"], x[pos_metric], x["rowNo"]))
     elif norm_sort == "highest_price":
-        candidates.sort(key=lambda x: (-x["unitPrice"], x["centerScore"], x["rowNo"]))
+        candidates.sort(key=lambda x: (-x["unitPrice"], x[pos_metric], x["rowNo"]))
     else:
-        candidates.sort(key=lambda x: (x["centerScore"], x["rowNo"]))
+        candidates.sort(key=lambda x: (x[pos_metric], x["rowNo"]))
 
     best = candidates[0] if candidates else None
     alternatives: List[Dict[str, Any]] = []
@@ -769,7 +879,7 @@ async def recommend_seats(
         tier_order = (
             candidates[1:]
             if norm_sort != "best_view"
-            else sorted(candidates[1:], key=lambda x: (-x["unitPrice"], x["centerScore"], x["rowNo"]))
+            else sorted(candidates[1:], key=lambda x: (-x["unitPrice"], x[pos_metric], x["rowNo"]))
         )
         for cand in tier_order:
             k = tuple(cand["seatIds"])
@@ -789,12 +899,14 @@ async def recommend_seats(
 
     return json.dumps({
         "found": best is not None,
+        "exactMatch": False,
         "isMock": not from_java,
         "source": "Java show-service(:8202)" if from_java else "本地 DEV_MOCK 座位矩阵",
         "showTitle": show_title,
         "sessionId": session_id,
         "sessionTitle": session_title,
         "sortBy": norm_sort,
+        "position": norm_pos,
         "priceTiers": price_tiers,
         "recommended": best,
         "alternatives": alternatives,

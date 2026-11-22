@@ -20,6 +20,9 @@ class SharedSlots(TypedDict, total=False):
     max_unit_price: Optional[float]
     last_unit_price: Optional[float]      # 上一次给用户推荐的单张票价，供“便宜一点/再低一档”向下筛选
     price_preference: Optional[str]       # "best_view" | "lowest_price" | "highest_price"
+    position_preference: Optional[str]    # 座位横向位置偏好："center"（中轴，默认）| "side"（靠边/过道）
+    preferred_row: Optional[int]          # 本轮用户明确指定的排号（1~6），单轮坐标约束，避免误当成数据库 seat_id
+    preferred_col: Optional[int]          # 本轮用户明确指定的列/座号（1~8），与 preferred_row 组合精确查座
     seat_ids: Optional[List[int]]
     seat_labels: Optional[List[str]]
     order_no: Optional[str]
