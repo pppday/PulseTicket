@@ -7,12 +7,19 @@ from app.config import settings
 
 
 class SharedSlots(TypedDict, total=False):
-    """跨子图共享的结构化业务槽位（随多轮对话持续记忆与更新）"""
+    """
+    【跨子图/跨轮次共享的结构化业务槽位】
+    原因：每次进入子图时会重置子图临时消息列表（防历史冗余干扰推理），
+    因此把演出名、场次 ID、张数、预算上限、上一轮推荐单价与价格偏好存在主图 SharedSlots 中，
+    再由 LangGraph Checkpointer 持久化到 PostgreSQL，实现“白雪公主 -> 有便宜一点的吗 -> 就锁这个”多轮衔接。
+    """
     show_keyword: Optional[str]
     category: Optional[str]
     session_id: Optional[int]
     seat_count: Optional[int]
     max_unit_price: Optional[float]
+    last_unit_price: Optional[float]      # 上一次给用户推荐的单张票价，供“便宜一点/再低一档”向下筛选
+    price_preference: Optional[str]       # "best_view" | "lowest_price" | "highest_price"
     seat_ids: Optional[List[int]]
     seat_labels: Optional[List[str]]
     order_no: Optional[str]

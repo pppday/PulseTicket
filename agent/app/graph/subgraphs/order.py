@@ -474,7 +474,17 @@ def _route_after_verify(state: OrderSubState) -> str:
 
 
 def build_order_subgraph():
-    """构建并编译子 Agent ③：订单与售后子图"""
+    """
+    构建并编译子 Agent ③：订单售后子图（查单算费与退改预检分离，严禁大模型心算退票费用）。
+
+    内部有向图流转：
+      START -> order_agent(LLM 推理：Chat模式仅绑只读工具，Agent模式加绑取消/退票提案工具)
+            ├── 调 list_my_orders / check_order_refund_detail -> order_read_tools(调 Java 查单 + Python Decimal 精准算费 + 推 ORDER_PICKER) -> 回到 order_agent
+            ├── 调 propose_cancel_order / propose_refund_order -> verify_cancel(调 Java 核验订单状态与退票时间窗)
+            │      ├── 状态不符 / 距开演不足 24h -> 拦截消息退回 order_agent 说明
+            │      └── 校验通过 -> 生成 CANCEL_ORDER / REFUND_ORDER pending_action -> END (交由主图 interrupt 挂起等确认)
+            └── 无工具调用或达步数上限 -> END
+    """
     builder = StateGraph(OrderSubState)
     builder.add_node("order_agent", order_agent_node)
     builder.add_node("order_read_tools", order_read_tools_node)

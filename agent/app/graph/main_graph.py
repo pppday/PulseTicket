@@ -27,7 +27,19 @@ from app.observability.tracer import AgentTracer, agent_tracer
 from app.storage.conversation_store import ConversationStore, conversation_store, to_iso_utc, utc_now
 from app.tools.ticket_tools import current_user_ctx, execute_confirmed_write_action
 
-# 预编译三大业务子图（主图将它们作为黑盒专员节点按序调度，子图间严禁互相网状调用）
+# ==============================================================================
+# 【PulseTicket 多智能体主控图 (MainGraph) 架构总览】
+#
+# 1. 为什么采用「主图 + 3 个黑盒隔离业务子图」而不是把所有工具塞给单 Agent？
+#    - 最小权限隔离：知识问答(只读RAG)、选座购票(查场次/推荐/核价)、订单售后(查单/算费/预检)
+#      各自拥有独立的 State 与有限工具列表，从物理上防止“问退票规则时误触锁座”或越权调工具；
+#    - 控制复杂度：把复杂子流程（如 RAG 自反思重试、确定性服务端核价）封装在黑盒子图内部，
+#      主图只负责“安检 -> 意图队列拆解 -> 按序派单 -> 人工确认门控 -> 汇总结果”；
+#    - 严禁子图之间网状互调：所有跨模块协作（如“先查退票规则再推荐座位”）统一通过主图共享状态
+#      (MainGraphState.slots / intents) 调度，链路确定、可观测、易排查且无循环死锁。
+#
+# 2. 预编译三大业务子图：
+# ==============================================================================
 _KNOWLEDGE_SUBGRAPH = build_knowledge_subgraph()
 _PURCHASE_SUBGRAPH = build_purchase_subgraph()
 _ORDER_SUBGRAPH = build_order_subgraph()
@@ -479,6 +491,13 @@ def _route_after_guard(state: MainGraphState) -> str:
 
 
 def _route_next_intent(state: MainGraphState) -> str:
+    """
+    【主图循环调度器】：
+    依据 intent_router 排好序的意图队列 `intents` 和当前游标 `intent_cursor` 依次派发给黑盒子图：
+    - 任一子图产生高风险写提案 pending_action -> 立即拐入 confirm_action 触发 interrupt 人工确认；
+    - 否则每跑完一个子图就自增 intent_cursor 并回到本调度器取下一棒；
+    - 全部意图完成后进入 response_composer 汇总。
+    """
     if state.get("pending_action"):
         return "confirm_action"
     intents = state.get("intents") or []
@@ -497,7 +516,10 @@ def _route_next_intent(state: MainGraphState) -> str:
 
 
 def build_main_agent_graph() -> StateGraph:
-    """构建主 Graph（安全护栏 + 意图路由 + 3 个业务子图调度 + 确认门控 + 汇总输出）"""
+    """
+    构建并组装主 Graph（采用星型/总线式调度，子图之间零直接连边）：
+      START -> input_guard -> intent_router -> (循环经过各子图) -> [confirm_action] -> response_composer -> END
+    """
     builder = StateGraph(MainGraphState)
 
     builder.add_node("input_guard", input_guard_node)

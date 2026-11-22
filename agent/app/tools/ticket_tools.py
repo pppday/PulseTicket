@@ -9,11 +9,37 @@ from langchain_core.tools import tool
 from app.config import settings
 from app.rag.hybrid_rag import hybrid_rag_engine
 
+# ==============================================================================
+# 【前后端与 Agent 职责边界说明】
+# Python Agent 服务本身不直连业务 MySQL 库：
+#   - 演出目录、48 座矩阵库存、权威核价：统一经 HTTP 调用 Java show-service (:8202)
+#   - 查询个人订单、锁座创单、取消未支付单、阶梯退票：统一经 HTTP 调用 Java order-service (:8203)
+# Python 侧只做：意图路由、RAG 条款检索、连座筛选与写前确定性预校验，彻底杜绝大模型篡改票价或越权写库。
+# ==============================================================================
+
 # 请求级上下文变量：禁止设置任何默认用户（缺失时严格拒绝服务，杜绝越权替 1 号用户下单）
 current_user_ctx: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextvars.ContextVar(
     "current_user_ctx",
     default=None,
 )
+
+
+def _clean_seat_label(zone_name: Any, raw_label: Any) -> str:
+    """去掉座位名称里重复的区域前缀（如把 '内场全息至尊区 1排04座' 规范为 '1排04座'）。"""
+    z = str(zone_name or "").strip()
+    lbl = str(raw_label or "").strip()
+    if z and lbl.startswith(z):
+        stripped = lbl[len(z):].strip(" ·-")
+        if stripped:
+            return stripped
+    return lbl
+
+
+def _format_full_seat_label(zone_name: Any, raw_label: Any) -> str:
+    """统一拼接 '区域名 排座号'，避免出现两次重复区域名。"""
+    z = str(zone_name or "").strip()
+    short_lbl = _clean_seat_label(z, raw_label)
+    return f"{z} {short_lbl}".strip() if z else short_lbl
 
 
 def get_required_user() -> Dict[str, Any]:
@@ -218,7 +244,7 @@ def _compute_quote_from_seat_map(
 
     total = sum(Decimal(str(seat_by_id[sid]["price"])) for sid in sorted_ids)
     labels = [
-        f"{seat_by_id[sid].get('zoneName', '')} {seat_by_id[sid].get('seatLabel', '')}".strip()
+        _format_full_seat_label(seat_by_id[sid].get("zoneName"), seat_by_id[sid].get("seatLabel"))
         for sid in sorted_ids
     ]
     return {
@@ -601,13 +627,26 @@ async def recommend_seats(
     session_id: int,
     count: int = 2,
     max_unit_price: Optional[float] = None,
+    sort_by: str = "best_view",
 ) -> str:
     """
-    【Java show-service 智能连座推荐工具】
-    根据场次 ID (session_id)、需要购买的张数 (count) 和单张最高预算 (max_unit_price)，
-    实时拉取场次座位图，自动过滤已售/已锁座位，并在同一排内计算最靠近中轴线的最佳连座组合。
+    【Java show-service 智能连座与多票档推荐工具】
+    根据场次 ID (session_id)、需要购买的张数 (count)、单张最高预算 (max_unit_price) 和排序偏好 (sort_by)，
+    实时拉取 Java 48 座矩阵库存，自动过滤已售/已锁座位并在同一排内计算最佳连座组合，
+    同时始终返回该场次全部在售票档汇总 (`priceTiers`)，便于向用户提供更便宜或更靠前选项：
+    - `sort_by="best_view"`: 优先中轴线视野最佳前排（默认）
+    - `sort_by="lowest_price"`: 优先最低价格档位（当用户问“便宜一点 / 低价 / 性价比 / 看台”时必须传此值）
+    - `sort_by="highest_price"`: 优先最高 VIP 票档
     """
     count = max(1, min(6, int(count)))
+    norm_sort = str(sort_by or "best_view").strip().lower()
+    if norm_sort in ("lowest_price", "cheapest", "lowest", "price_asc", "low_price"):
+        norm_sort = "lowest_price"
+    elif norm_sort in ("highest_price", "vip", "highest", "price_desc", "high_price"):
+        norm_sort = "highest_price"
+    else:
+        norm_sort = "best_view"
+
     seats: List[Dict[str, Any]] = []
     show_title = ""
     session_title = f"场次 #{session_id}"
@@ -648,42 +687,105 @@ async def recommend_seats(
         session_title = mock_map["session"]["sessionTitle"]
         seats = mock_map["seats"]
 
+    all_available = [s for s in seats if s.get("status") == "AVAILABLE"]
+
+    def _build_contiguous_candidates(seat_pool: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        rows_map: Dict[int, List[Dict[str, Any]]] = {}
+        for s in seat_pool:
+            rows_map.setdefault(int(s["rowNo"]), []).append(s)
+
+        out: List[Dict[str, Any]] = []
+        for r_no, r_seats in rows_map.items():
+            r_seats.sort(key=lambda x: int(x["colNo"]))
+            for i in range(len(r_seats) - count + 1):
+                window = r_seats[i : i + count]
+                if int(window[-1]["colNo"]) - int(window[0]["colNo"]) == count - 1:
+                    center_dist = sum(abs(float(x["colNo"]) - 4.5) for x in window) / count
+                    total_price = sum(float(x["price"]) for x in window)
+                    z_name = str(window[0].get("zoneName") or "").strip()
+                    out.append({
+                        "rowNo": r_no,
+                        "zoneName": z_name,
+                        "seatIds": [int(x["id"]) for x in window],
+                        "seatLabels": [_clean_seat_label(z_name, x.get("seatLabel")) for x in window],
+                        "unitPrice": round(float(window[0]["price"]), 2),
+                        "totalAmount": round(total_price, 2),
+                        "centerScore": round(center_dist, 2),
+                    })
+        return out
+
+    # 始终统计该场次全部可用票档汇总，避免大模型“盲人摸象”不知道还有更便宜档位
+    tier_buckets: Dict[tuple, List[Dict[str, Any]]] = {}
+    for s in all_available:
+        key = (round(float(s.get("price", 0)), 2), str(s.get("zoneName") or "").strip())
+        tier_buckets.setdefault(key, []).append(s)
+
+    price_tiers: List[Dict[str, Any]] = []
+    for (tier_price, tier_zone), tier_seats in sorted(tier_buckets.items(), key=lambda kv: kv[0][0]):
+        tier_cands = _build_contiguous_candidates(tier_seats)
+        tier_cands.sort(key=lambda x: (x["centerScore"], x["rowNo"]))
+        price_tiers.append({
+            "unitPrice": tier_price,
+            "zoneName": tier_zone,
+            "availableSeats": len(tier_seats),
+            "bestOption": tier_cands[0] if tier_cands else None,
+        })
+
     available = [
-        s for s in seats
-        if s.get("status") == "AVAILABLE"
-        and (max_unit_price is None or float(s.get("price", 0)) <= float(max_unit_price))
+        s for s in all_available
+        if max_unit_price is None or float(s.get("price", 0)) <= float(max_unit_price)
     ]
 
     if len(available) < count:
+        lowest_hint = (
+            f"当前全场最低可售档位为「{price_tiers[0]['zoneName']}」¥{price_tiers[0]['unitPrice']}/张（余 {price_tiers[0]['availableSeats']} 座）。"
+            if price_tiers
+            else "当前场次暂无可售余座。"
+        )
         return json.dumps({
             "found": False,
-            "message": f"当前场次满足预算（<={max_unit_price}元）的空余座位不足 {count} 个。",
-        }, ensure_ascii=False)
+            "showTitle": show_title,
+            "sessionId": session_id,
+            "sessionTitle": session_title,
+            "sortBy": norm_sort,
+            "priceTiers": price_tiers,
+            "message": f"当前场次满足预算（<= ¥{max_unit_price}）的空余座位不足 {count} 个。{lowest_hint}",
+        }, ensure_ascii=False, indent=2)
 
-    rows_map: Dict[int, List[Dict[str, Any]]] = {}
-    for s in available:
-        rows_map.setdefault(int(s["rowNo"]), []).append(s)
+    candidates = _build_contiguous_candidates(available)
+    if norm_sort == "lowest_price":
+        candidates.sort(key=lambda x: (x["unitPrice"], x["centerScore"], x["rowNo"]))
+    elif norm_sort == "highest_price":
+        candidates.sort(key=lambda x: (-x["unitPrice"], x["centerScore"], x["rowNo"]))
+    else:
+        candidates.sort(key=lambda x: (x["centerScore"], x["rowNo"]))
 
-    candidates = []
-    for r_no, r_seats in rows_map.items():
-        r_seats.sort(key=lambda x: int(x["colNo"]))
-        for i in range(len(r_seats) - count + 1):
-            window = r_seats[i : i + count]
-            if int(window[-1]["colNo"]) - int(window[0]["colNo"]) == count - 1:
-                center_dist = sum(abs(float(x["colNo"]) - 4.5) for x in window) / count
-                total_price = sum(float(x["price"]) for x in window)
-                candidates.append({
-                    "rowNo": r_no,
-                    "zoneName": window[0].get("zoneName"),
-                    "seatIds": [int(x["id"]) for x in window],
-                    "seatLabels": [x["seatLabel"] for x in window],
-                    "unitPrice": float(window[0]["price"]),
-                    "totalAmount": round(total_price, 2),
-                    "centerScore": round(center_dist, 2),
-                })
-
-    candidates.sort(key=lambda x: (x["centerScore"], x["rowNo"]))
     best = candidates[0] if candidates else None
+    alternatives: List[Dict[str, Any]] = []
+    if best is not None:
+        used_keys = {tuple(best["seatIds"])}
+        seen_prices = {best["unitPrice"]}
+        # 跨票档优先挑选不同价位档位的代表席位（如 ¥880 / ¥580 / ¥280 并列展示），方便用户直观比价
+        tier_order = (
+            candidates[1:]
+            if norm_sort != "best_view"
+            else sorted(candidates[1:], key=lambda x: (-x["unitPrice"], x["centerScore"], x["rowNo"]))
+        )
+        for cand in tier_order:
+            k = tuple(cand["seatIds"])
+            if cand["unitPrice"] not in seen_prices and k not in used_keys:
+                alternatives.append(cand)
+                used_keys.add(k)
+                seen_prices.add(cand["unitPrice"])
+                if len(alternatives) >= 2:
+                    break
+        for cand in candidates[1:]:
+            if len(alternatives) >= 2:
+                break
+            k = tuple(cand["seatIds"])
+            if k not in used_keys:
+                alternatives.append(cand)
+                used_keys.add(k)
 
     return json.dumps({
         "found": best is not None,
@@ -692,8 +794,10 @@ async def recommend_seats(
         "showTitle": show_title,
         "sessionId": session_id,
         "sessionTitle": session_title,
+        "sortBy": norm_sort,
+        "priceTiers": price_tiers,
         "recommended": best,
-        "alternatives": candidates[1:3],
+        "alternatives": alternatives,
     }, ensure_ascii=False, indent=2)
 
 

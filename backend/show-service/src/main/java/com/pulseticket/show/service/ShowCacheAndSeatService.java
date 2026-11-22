@@ -39,6 +39,13 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 
+/**
+ * 演出目录、缓存三防、实时座位库存与权威核价核心服务。
+ *
+ * 【前后端 & Python Agent 统一数据源】：
+ * - Vue 前端选座页 与 Python 选座子图 (`search_shows / recommend_seats / server_quote`)
+ *   全部通过 HTTP 调用本服务读写真实库存与权威票价，禁止任何端侧自行算价或直连 MySQL。
+ */
 @Service
 @RequiredArgsConstructor
 public class ShowCacheAndSeatService {
@@ -236,7 +243,7 @@ public class ShowCacheAndSeatService {
         List<BigDecimal> unitPrices = new ArrayList<>();
         for (SeatInventory seat : seats) {
             totalAmount = totalAmount.add(seat.getPrice());
-            seatLabels.add(seat.getZoneName() + " " + seat.getSeatLabel());
+            seatLabels.add(formatFullSeatLabel(seat.getZoneName(), seat.getSeatLabel()));
             unitPrices.add(seat.getPrice());
         }
 
@@ -322,7 +329,7 @@ public class ShowCacheAndSeatService {
         List<String> labels = new ArrayList<>();
         for (SeatInventory seat : lockedSeats) {
             totalAmount = totalAmount.add(seat.getPrice());
-            labels.add(seat.getZoneName() + " " + seat.getSeatLabel());
+            labels.add(formatFullSeatLabel(seat.getZoneName(), seat.getSeatLabel()));
         }
 
         evictShowCaches(session.getShowId(), dto.getSessionId());
@@ -939,6 +946,18 @@ public class ShowCacheAndSeatService {
             "^\\s*\\d{1,2}月\\d{1,2}日(?:\\s*周[一二三四五六日天])?(?:\\s*\\d{1,2}:\\d{2})?\\s*"
     );
 
+    /**
+     * 规范化拼接“区域名 + 排座号”，防止历史 seatLabel 已含区域名时重复拼接两次
+     */
+    public static String formatFullSeatLabel(String zoneName, String seatLabel) {
+        String z = zoneName != null ? zoneName.trim() : "";
+        String lbl = seatLabel != null ? seatLabel.trim() : "";
+        if (!z.isEmpty() && lbl.startsWith(z)) {
+            return lbl;
+        }
+        return z.isEmpty() ? lbl : (z + " " + lbl).trim();
+    }
+
     public static String chineseWeekday(DayOfWeek dow) {
         return switch (dow) {
             case MONDAY -> "周一";
@@ -1033,7 +1052,7 @@ public class ShowCacheAndSeatService {
                         .showId(show.getId())
                         .rowNo(r)
                         .colNo(c)
-                        .seatLabel(String.format("%s %d排%02d座", zoneName, r, c))
+                        .seatLabel(String.format("%d排%02d座", r, c))
                         .zoneCode(zoneCode)
                         .zoneName(zoneName)
                         .price(price)

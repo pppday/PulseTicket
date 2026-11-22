@@ -11,6 +11,7 @@ from app.graph.thought_stream import astream_llm_message, emit_thought, emit_too
 from app.tools.ticket_tools import (
     PURCHASE_READ_TOOLS,
     PURCHASE_WRITE_TOOLS,
+    _clean_seat_label,
     current_user_ctx,
     quote_seats_from_server,
 )
@@ -94,6 +95,10 @@ async def purchase_agent_node(state: PurchaseSubState) -> Dict[str, Any]:
         f"【共享上下文槽位】: {json.dumps(slots, ensure_ascii=False)}\n"
         f"【最近 3 轮对话】: {state.get('history_summary') or '无'}\n"
         f"【执行约束】: {commit_rule}\n"
+        "选座工具传参与多档比价策略：\n"
+        "1. 若共享槽位中已确定 `session_id` 且用户是在调整预算/询问“有便宜一点的吗/换其他价位”，**无需重复调用 `search_shows`**，直接调用 `recommend_seats`；\n"
+        "2. 调用 `recommend_seats` 时必须对齐共享槽位：将 `sort_by` 设为 `slots.price_preference`（未指定传 `'best_view'`；若用户问便宜一点/低价/看台必须传 `'lowest_price'`），将 `max_unit_price` 设为 `slots.max_unit_price`；\n"
+        "3. 回复推荐结果时，利用工具返回的 `priceTiers` 顺带说明该场次还有哪些在售票档与余座（例如“另设有 ¥580 优选区 / ¥280 看台区可选”）；若 `found=False` 说明预算内无余座，必须如实告知 `priceTiers` 中当前最低可售档位。\n"
         "严禁在同一条回复里同时混调只读工具和 `propose_create_order`；若后端服务不可达或无余座，必须如实说明。"
     )
 
@@ -172,21 +177,30 @@ async def purchase_read_tools_node(state: PurchaseSubState) -> Dict[str, Any]:
             t_args = tc.get("args") or {}
             t_id = tc["id"]
 
-            steps.append({"agent": "purchase_agent", "tool": t_name, "args": t_args})
+            effective_args = dict(t_args)
+            if t_name == "recommend_seats":
+                if effective_args.get("count") is None and slots.get("seat_count"):
+                    effective_args["count"] = int(slots["seat_count"])
+                if effective_args.get("max_unit_price") is None and slots.get("max_unit_price") is not None:
+                    effective_args["max_unit_price"] = float(slots["max_unit_price"])
+                if not effective_args.get("sort_by") and slots.get("price_preference"):
+                    effective_args["sort_by"] = str(slots["price_preference"])
+
+            steps.append({"agent": "purchase_agent", "tool": t_name, "args": effective_args})
 
             if t_name in _PURCHASE_READ_MAP:
                 card_id = f"tool-{t_name}-{t_id}"
                 card_title = (
                     "查询在售演出与场次库存"
                     if t_name == "search_shows"
-                    else f"智能推荐场次 #{t_args.get('session_id')} 最佳连座"
+                    else f"智能推荐场次 #{effective_args.get('session_id')} 最佳连座"
                 )
                 emit_thought(
                     key=f"pur-tool-{t_id}",
                     phase="purchase",
                     agent_label="选座购票子图",
-                    title="正在查询在售演出目录…" if t_name == "search_shows" else f"正在计算场次 #{t_args.get('session_id')} 中轴线最佳连座…",
-                    detail=json.dumps(t_args, ensure_ascii=False),
+                    title="正在查询在售演出目录…" if t_name == "search_shows" else f"正在计算场次 #{effective_args.get('session_id')} 中轴线最佳连座…",
+                    detail=json.dumps(effective_args, ensure_ascii=False),
                     status="running",
                 )
                 emit_tool_card(
@@ -195,9 +209,9 @@ async def purchase_read_tools_node(state: PurchaseSubState) -> Dict[str, Any]:
                     title=card_title,
                     status="running",
                     summary="正在向 Java show-service 获取实时数据…",
-                    input_data=t_args,
+                    input_data=effective_args,
                 )
-                obs = await _PURCHASE_READ_MAP[t_name].ainvoke(t_args)
+                obs = await _PURCHASE_READ_MAP[t_name].ainvoke(effective_args)
                 obs_str = str(obs)
                 out_msgs.append(ToolMessage(content=obs_str, name=t_name, tool_call_id=t_id))
 
@@ -264,7 +278,7 @@ async def purchase_read_tools_node(state: PurchaseSubState) -> Dict[str, Any]:
                             options=show_options,
                         )
 
-                # 自动将最新推荐出来的最佳连座记忆到跨轮共享槽位 slots，方便下一轮“就锁这两张吧”直接引用
+                # 自动将最新推荐出来的最佳连座与推荐单价记忆到跨轮共享槽位 slots，方便下一轮“有便宜一点的吗 / 就锁这两张”无缝衔接
                 if t_name == "recommend_seats":
                     try:
                         parsed = json.loads(obs_str)
@@ -273,14 +287,23 @@ async def purchase_read_tools_node(state: PurchaseSubState) -> Dict[str, Any]:
                             sid_val = int(parsed.get("sessionId") or t_args.get("session_id"))
                             slots["session_id"] = sid_val
                             slots["seat_ids"] = [int(x) for x in (rec.get("seatIds") or [])]
-                            slots["seat_labels"] = list(rec.get("seatLabels") or [])
+                            if slots["seat_ids"]:
+                                slots["seat_count"] = len(slots["seat_ids"])
+                            clean_rec_labels = [
+                                _clean_seat_label(rec.get("zoneName"), lb)
+                                for lb in (rec.get("seatLabels") or [])
+                            ]
+                            slots["seat_labels"] = clean_rec_labels
+                            if rec.get("unitPrice") is not None:
+                                slots["last_unit_price"] = float(rec["unitPrice"])
+                            labels_str = "、".join(clean_rec_labels)
                             emit_thought(
                                 key=f"pur-tool-{t_id}",
                                 phase="purchase",
                                 agent_label="选座购票子图",
-                                title=f"场次 #{slots['session_id']} 最优连座：{'、'.join(slots['seat_labels'])}",
+                                title=f"场次 #{slots['session_id']} 最优方案：{labels_str}",
                                 detail=(
-                                    f"区域：{rec.get('zoneName')} · 合计 ¥{rec.get('totalAmount')} "
+                                    f"区域：{rec.get('zoneName')} · 单价 ¥{rec.get('unitPrice')} · 合计 ¥{rec.get('totalAmount')} "
                                     f"（中轴线偏移分 {rec.get('centerScore')}）"
                                 ),
                                 badges=[f"#{slots['session_id']}", f"¥{rec.get('totalAmount')}"],
@@ -291,24 +314,37 @@ async def purchase_read_tools_node(state: PurchaseSubState) -> Dict[str, Any]:
                                 tool_name=t_name,
                                 title=card_title,
                                 status="done",
-                                summary=f"已推荐 {rec.get('zoneName')} · {'、'.join(slots['seat_labels'])}（合计 ¥{rec.get('totalAmount')}）",
-                                input_data=t_args,
+                                summary=f"已推荐 {rec.get('zoneName')} {labels_str}（单价 ¥{rec.get('unitPrice')} · 合计 ¥{rec.get('totalAmount')}）",
+                                input_data=effective_args,
                                 output_data=parsed,
                             )
                             if mode != "chat" and not slots.get("wants_commit"):
                                 candidates = [rec] + list(parsed.get("alternatives") or [])
+                                sort_pref = parsed.get("sortBy") or effective_args.get("sort_by") or "best_view"
+                                rec_unit = rec.get("unitPrice")
                                 seat_options = []
                                 for idx, opt in enumerate(candidates[:3]):
                                     opt_ids = [int(x) for x in (opt.get("seatIds") or [])]
-                                    opt_labels = list(opt.get("seatLabels") or [])
+                                    z_name = str(opt.get("zoneName") or "").strip()
+                                    opt_labels = [
+                                        _clean_seat_label(z_name, lb)
+                                        for lb in (opt.get("seatLabels") or [])
+                                    ]
                                     labels_joined = "、".join(opt_labels)
+                                    opt_unit = opt.get("unitPrice")
+                                    if idx == 0:
+                                        badge_txt = "低价优选" if sort_pref == "lowest_price" else "最佳中轴"
+                                    elif opt_unit is not None and opt_unit != rec_unit:
+                                        badge_txt = f"¥{int(float(opt_unit))} 档"
+                                    else:
+                                        badge_txt = f"备选 #{idx}"
                                     seat_options.append({
                                         "id": f"seat-{sid_val}-{'-'.join(str(x) for x in opt_ids)}",
-                                        "label": f"{opt.get('zoneName', '')} · {labels_joined}".strip(" ·"),
-                                        "badge": "最佳中轴" if idx == 0 else f"备选 #{idx}",
-                                        "meta": f"单价 ¥{opt.get('unitPrice')} · 合计 ¥{opt.get('totalAmount')}",
+                                        "label": f"{z_name} · {labels_joined}".strip(" ·"),
+                                        "badge": badge_txt,
+                                        "meta": f"单价 ¥{opt_unit} · 合计 ¥{opt.get('totalAmount')}",
                                         "price": opt.get("totalAmount"),
-                                        "prompt": f"请帮我锁定场次 session_id={sid_val} seat_ids={opt_ids}（{labels_joined}）并下单",
+                                        "prompt": f"请帮我锁定场次 session_id={sid_val} seat_ids={opt_ids}（{z_name} {labels_joined}）并下单",
                                     })
                                 if seat_options:
                                     emit_widget(
@@ -531,7 +567,17 @@ def _route_after_quote(state: PurchaseSubState) -> str:
 
 
 def build_purchase_subgraph():
-    """构建并编译子 Agent ②：选座购票子图"""
+    """
+    构建并编译子 Agent ②：选座购票子图（只读推荐与服务端确定性核价分离，严禁模型直接写库）。
+
+    内部有向图流转：
+      START -> purchase_agent(LLM 推理：Chat模式仅绑只读工具，Agent模式加绑提案工具)
+            ├── 调 search_shows / recommend_seats -> purchase_read_tools(调 Java 查余座 + 写回 SharedSlots + 推 PICKER) -> 回到 purchase_agent
+            ├── 调 propose_create_order -> server_quote(绕过模型直接调 Java 权威核价与余座检验)
+            │      ├── 余座被抢/过期 -> 报错 ToolMessage 退回 purchase_agent 说明
+            │      └── 核价通过 -> 打包 pending_action -> END (交由主图 confirm_action 触发 interrupt 挂起等确认)
+            └── 无工具调用或达步数上限 -> END
+    """
     builder = StateGraph(PurchaseSubState)
     builder.add_node("purchase_agent", purchase_agent_node)
     builder.add_node("purchase_read_tools", purchase_read_tools_node)

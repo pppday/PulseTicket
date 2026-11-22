@@ -358,7 +358,17 @@ async def refuse_answer_node(state: KnowledgeSubState) -> Dict[str, Any]:
 
 
 def build_knowledge_subgraph():
-    """构建并编译子 Agent ①：知识问答 Agentic RAG 子图"""
+    """
+    构建并编译子 Agent ①：知识问答 Agentic RAG 子图（纯只读，无任何业务写工具）。
+
+    内部有向图流转：
+      START -> query_rewrite(口语消歧与同义词改写)
+            -> hybrid_retrieve(jieba BM25 + bge-m3/pgvector + RRF + Rerank)
+            -> grade_evidence(盲区词表 + 重合度评估)
+               ├── 证据不足且首次尝试 (retry < 1) -> 回到 query_rewrite 扩词自反思重试
+               ├── 证据充分 -> generate_answer(严格受控生成 + 强制注入 [POL-xxx] 引用) -> END
+               └── 重试后仍不足/命中未覆盖盲区 -> refuse_answer(零幻觉诚实拒答) -> END
+    """
     builder = StateGraph(KnowledgeSubState)
     builder.add_node("query_rewrite", query_rewrite_node)
     builder.add_node("hybrid_retrieve", hybrid_retrieve_node)

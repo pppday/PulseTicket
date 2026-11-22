@@ -339,6 +339,115 @@ class TestStreamingAndModes(unittest.IsolatedAsyncioTestCase):
             self.assertIn("900.0", r2["reply"])
             self.assertIn("USER_REFUND", r2["reply"])
 
+    async def test_8_recommend_seats_multitier_cheaper_and_label_dedup(self):
+        # 模拟与线上 show 6 (白雪公主 #403) 一致的 3 个票档且 seatLabel 含冗余区域前缀的脏数据
+        seats_403 = []
+        sid = 289
+        for r in range(1, 7):
+            zone = "内场全息至尊区" if r <= 2 else ("中轴声场优选区" if r <= 4 else "全景看台标准区")
+            price = 880.0 if r <= 2 else (580.0 if r <= 4 else 280.0)
+            for c in range(1, 9):
+                seats_403.append({
+                    "id": sid,
+                    "sessionId": 403,
+                    "rowNo": r,
+                    "colNo": c,
+                    "seatLabel": f"{zone} {r}排{c:02d}座",
+                    "zoneName": zone,
+                    "price": price,
+                    "status": "AVAILABLE",
+                })
+                sid += 1
+
+        seat_payload_403 = {
+            "code": 200,
+            "data": {
+                "show": {"id": 6, "title": "白雪公主", "status": "ON_SALE"},
+                "session": {"id": 403, "sessionTitle": "12月24日 周四 19:30 平安夜黄金场"},
+                "seats": seats_403,
+            },
+        }
+
+        # 1) 验证 recommend_seats 直接输出全票档汇总 priceTiers、跨档 alternatives 与去重 seatLabels
+        tok = tools_mod.current_user_ctx.set({"user_id": 1001, "username": "zhaolan", "role": "USER"})
+        try:
+            with patch.object(tools_mod.httpx.AsyncClient, "get", new=AsyncMock(return_value=FakeHttpResp(200, seat_payload_403))):
+                raw_best = await tools_mod.recommend_seats.ainvoke({"session_id": 403, "count": 1, "sort_by": "best_view"})
+                parsed_best = json.loads(raw_best)
+                self.assertTrue(parsed_best["found"])
+                self.assertEqual(parsed_best["recommended"]["unitPrice"], 880.0)
+                self.assertEqual(parsed_best["recommended"]["seatLabels"], ["1排04座"])
+                self.assertEqual([t["unitPrice"] for t in parsed_best["priceTiers"]], [280.0, 580.0, 880.0])
+                alt_prices = {a["unitPrice"] for a in parsed_best["alternatives"]}
+                self.assertIn(580.0, alt_prices)
+                self.assertIn(280.0, alt_prices)
+        finally:
+            tools_mod.current_user_ctx.reset(tok)
+
+        # 2) 验证多轮对话："帮我买张白雪公主的票" -> "有便宜一点的吗"
+        router_calls = []
+
+        class DynamicRouterLLM:
+            async def ainvoke(self, msgs):
+                idx = len(router_calls)
+                router_calls.append(idx)
+                if idx == 0:
+                    return AIMessage(content='{"intents": ["purchase"], "slots": {"show_keyword": "白雪公主", "seat_count": 1, "wants_commit": false}}')
+                return AIMessage(content='{"intents": ["purchase"], "slots": {"price_preference": "lowest_price", "wants_commit": false}}')
+
+        shows_payload_403 = {
+            "code": 200,
+            "data": [{
+                "show": {"id": 6, "title": "白雪公主", "category": "CONCERT", "city": "上海", "venueName": "梅赛德斯-奔驰文化中心 · 主场馆", "minPrice": 280.0, "maxPrice": 880.0},
+                "sessions": [{"id": 403, "sessionTitle": "12月24日 周四 19:30 平安夜黄金场", "hallName": "中央全息穹顶大厅", "availableSeats": 48}],
+            }],
+        }
+
+        async def _fake_get(url, *args, **kwargs):
+            if "/public/list" in str(url):
+                return FakeHttpResp(200, shows_payload_403)
+            return FakeHttpResp(200, seat_payload_403)
+
+        pur_llm = FakeStreamingLLM([
+            AIMessage(content="", tool_calls=[{"id": "tc_s1", "name": "recommend_seats", "args": {"session_id": 403, "count": 1}, "type": "tool_call"}]),
+            ["为您推荐《白雪公主》最佳中轴座 ¥880，另有 ¥580 优选区与 ¥280 看台可选。"],
+            AIMessage(content="", tool_calls=[{"id": "tc_s2", "name": "recommend_seats", "args": {"session_id": 403, "count": 1, "max_unit_price": 879.0, "sort_by": "lowest_price"}, "type": "tool_call"}]),
+            ["已为您切换低价优先档：推荐全场最高性价比看台 ¥280 与中档 ¥580。"],
+        ])
+
+        events_turn1 = []
+        events_turn2 = []
+        with patch.object(gr_mod, "get_chat_llm", return_value=DynamicRouterLLM()), \
+             patch.object(pur_mod, "_get_purchase_llm", return_value=pur_llm), \
+             patch.object(tools_mod.httpx.AsyncClient, "get", side_effect=_fake_get):
+            async for ev in self.manager.stream_chat(
+                thread_id="th-snowwhite-cheaper",
+                user_message="帮我买张白雪公主的票",
+                user_id=1001,
+                username="zhaolan",
+                mode="agent",
+            ):
+                events_turn1.append(ev)
+
+            async for ev in self.manager.stream_chat(
+                thread_id="th-snowwhite-cheaper",
+                user_message="有便宜一点的吗",
+                user_id=1001,
+                username="zhaolan",
+                mode="agent",
+            ):
+                events_turn2.append(ev)
+
+        w1 = next(e["data"] for e in events_turn1 if e["event"] == "widget")
+        self.assertEqual(w1["widgetType"], "SEAT_PICKER")
+        self.assertNotIn("内场全息至尊区 · 内场全息至尊区", w1["options"][0]["label"])
+        self.assertGreaterEqual(len({o["price"] for o in w1["options"]}), 2)
+
+        w2 = next(e["data"] for e in events_turn2 if e["event"] == "widget")
+        self.assertEqual(w2["widgetType"], "SEAT_PICKER")
+        self.assertTrue(all(float(o["price"]) < 880.0 for o in w2["options"]), f"Turn 2 still had >=880 option: {w2['options']}")
+        self.assertEqual(w2["options"][0]["badge"], "低价优选")
+
 
 if __name__ == "__main__":
     unittest.main()

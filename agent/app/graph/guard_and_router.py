@@ -46,9 +46,20 @@ _POLICY_KW = (
 )
 _PURCHASE_KW = (
     "推荐", "选座", "连座", "座位", "有什么演出", "有哪些演出", "近期演出", "想看",
-    "星际回响", "歌剧魅影", "音乐剧", "星际穿越", "西湖", "爵士",
+    "星际回响", "歌剧魅影", "音乐剧", "星际穿越", "西湖", "爵士", "白雪公主",
     "订票", "锁座", "下单", "锁定", "买两张", "买一张", "余票",
-    "帮我买", "我想买", "我要买",
+    "帮我买", "我想买", "我要买", "便宜", "太贵", "贵了", "低价", "性价比",
+    "换个座位", "换座位", "其他价位", "别的价位", "看台",
+)
+_CHEAPER_KW = (
+    "便宜一点", "便宜点", "更便宜", "便宜些", "便宜的", "最便宜",
+    "太贵", "贵了", "低价", "性价比", "经济", "省钱", "看台", "便宜",
+)
+_RELATIVE_CHEAPER_KW = (
+    "便宜一点", "便宜点", "更便宜", "便宜些", "太贵", "贵了", "再便宜", "换个低价",
+)
+_HIGHER_KW = (
+    "贵一点", "更贵", "最好的", "最前排", "vip", "内场至尊", "前排", "视野最好",
 )
 _ORDER_KW = (
     "我的订单", "历史订单", "查订单", "订单状态", "取消订单", "退掉这单", "退订订单",
@@ -66,7 +77,7 @@ ROUTER_SYSTEM_PROMPT = """你是 PulseTicket 票务主控图的【意图路由�
 可选意图枚举（按需选 1~3 个，若同一句话既问规则又让选座/查演出，必须同时输出多个意图！）：
 - "policy": 询问退改规则、手续费、实名制、儿童身高、场馆地铁交通、禁带物品、寄存、发票/快递/宠物等平台政策与须知
 - "order": 查询用户名下已有订单、核实某笔已有订单能退多少钱、取消未支付订单或为已支付且符合窗口期的订单办理阶梯退票
-- "purchase": 查询在售演出场次、按预算推荐连座、或要求对选定座位发起锁座下单
+- "purchase": 查询在售演出场次、按预算或价位偏好（如“有便宜一点的吗/换低价看台”）推荐连座、或要求对选定座位发起锁座下单
 - "chitchat": 纯打招呼、感谢、闲聊（不涉及任何规则、演出、选座或订单）
 
 输出 JSON 格式示例：
@@ -78,13 +89,16 @@ ROUTER_SYSTEM_PROMPT = """你是 PulseTicket 票务主控图的【意图路由�
     "session_id": null,
     "seat_count": 2,
     "max_unit_price": 700,
+    "price_preference": "lowest_price",
     "seat_ids": null,
     "order_no": null,
     "wants_commit": false
   }
 }
 注意：
-- `wants_commit` 仅在用户明确要求“现在帮我锁座/下单/买下选定座位”时为 true；如果只是“帮我推荐/看看座位”则为 false！"""
+- `seat_count`: 仅在用户本轮明确提出新张数时填写，未提及时返回 null 以继承上下文已有张数。
+- `price_preference`: 用户要低价/便宜/性价比/看台传 `"lowest_price"`，要 VIP/前排/视野最好传 `"highest_price"`，默认 `"best_view"`（未提及可传 null）。
+- `wants_commit` 仅在用户明确要求“现在帮我锁座/下单/买下选定座位”时为 true；如果只是“帮我推荐/有便宜一点的吗/看看座位”则为 false！"""
 
 
 def detect_prompt_injection(text: str) -> Optional[str]:
@@ -129,8 +143,21 @@ def summarize_and_trim_history(
     return "\n".join(lines), recent_prior
 
 
+def _reset_stale_show_slots(slots: SharedSlots, keep_budget: bool = False) -> None:
+    """当用户切换到另一部新演出时，清理上一部演出残留的场次、座位与推荐单价槽位。"""
+    for k in ("session_id", "seat_ids", "seat_labels", "last_unit_price"):
+        slots.pop(k, None)
+    if not keep_budget:
+        slots.pop("max_unit_price", None)
+        slots.pop("price_preference", None)
+
+
 def extract_deterministic_signals(query: str, prev_slots: Optional[SharedSlots] = None) -> Tuple[List[str], SharedSlots]:
-    """确定性正则槽位抽取与意图兜底（既给 LLM Router 做先验校准，也在离线评测或 JSON 异常时兜底）。"""
+    """
+    【确定性正则槽位抽取与意图兜底】：
+    设计思路：把订单号、场次 ID、座位 ID、预算数字、价格偏好（如“便宜一点”）用确定性代码提前抽准，
+    既给 LLM Router 做先验校准（防模型抽丢），也在离线单测或模型波动时直接兜底路由。
+    """
     q = (query or "").strip()
     q_lower = q.lower()
     slots: SharedSlots = dict(prev_slots or {})
@@ -145,13 +172,15 @@ def extract_deterministic_signals(query: str, prev_slots: Optional[SharedSlots] 
     if m_sess:
         slots["session_id"] = int(m_sess.group(1))
 
-    # 3. 抽取张数 (如 两张 / 3张)
+    # 3. 抽取张数 (如 两张 / 3张 / "买张")
     m_cnt_digit = re.search(r"([1-6])\s*张", q)
     m_cnt_cn = re.search(r"([一两二三四五六])\s*张", q)
     if m_cnt_digit:
         slots["seat_count"] = int(m_cnt_digit.group(1))
     elif m_cnt_cn:
         slots["seat_count"] = _CN_NUM_MAP[m_cnt_cn.group(1)]
+    elif re.search(r"(?:买|要|来|订|抢|选)\s*张", q):
+        slots["seat_count"] = 1
 
     # 4. 抽取单价预算 (如 700元以内 / 500块以下)
     m_price = re.search(r"(\d{2,4})\s*(?:元|块)(?:以内|以下|左右|内)?", q)
@@ -160,6 +189,7 @@ def extract_deterministic_signals(query: str, prev_slots: Optional[SharedSlots] 
 
     # 5. 抽取明确指定的座位 ID 列表 (支持 seat_ids=[20] / seat_ids=[20, 21] 与 "20和21号座位" / "20号座位")
     m_seat_list = re.search(r"seat_ids\s*=\s*\[([\d,\s]+)\]", q, re.IGNORECASE)
+    m_seat_ids = None
     if m_seat_list:
         parsed_ids = sorted({int(x.strip()) for x in m_seat_list.group(1).split(",") if x.strip().isdigit()})
         if parsed_ids:
@@ -173,19 +203,40 @@ def extract_deterministic_signals(query: str, prev_slots: Optional[SharedSlots] 
             if m_single_seat:
                 slots["seat_ids"] = [int(m_single_seat.group(1))]
 
-    # 6. 抽取演出关键词
-    for kw in ("星际回响", "PulseLive", "歌剧魅影", "Phantom", "星际穿越", "Interstellar", "西湖仲夏夜", "梅赛德斯", "天桥", "万象城", "大麦"):
+    # 6. 抽取演出关键词；若切换到新演出则自动清理旧场次与旧座位槽位
+    for kw in ("星际回响", "PulseLive", "歌剧魅影", "Phantom", "星际穿越", "Interstellar", "西湖仲夏夜", "白雪公主", "梅赛德斯", "天桥", "万象城", "大麦"):
         if kw.lower() in q_lower:
+            prev_kw = str(slots.get("show_keyword") or "").strip().lower()
+            if prev_kw and prev_kw != kw.lower() and not m_sess and not m_seat_list:
+                _reset_stale_show_slots(slots, keep_budget=bool(m_price))
             slots["show_keyword"] = kw
             break
 
-    # 7. 判断本轮是否明确发起锁座下单
+    # 7. 价格偏好感知：解决“有便宜一点的吗 / 换个低价档 / 最前排 VIP”多轮衔接
+    explicit_explicit_seats = bool(m_seat_list or m_seat_ids)
+    if any(k in q for k in _CHEAPER_KW):
+        slots["price_preference"] = "lowest_price"
+        if not explicit_explicit_seats:
+            slots.pop("seat_ids", None)
+            slots.pop("seat_labels", None)
+        if not m_price and any(k in q for k in _RELATIVE_CHEAPER_KW) and slots.get("last_unit_price"):
+            # 基于上轮推荐价（如 ¥880）自动设置严格更低的单价上限（¥879.0）
+            slots["max_unit_price"] = round(max(1.0, float(slots["last_unit_price"]) - 1.0), 2)
+    elif any(k in q_lower for k in _HIGHER_KW):
+        slots["price_preference"] = "highest_price"
+        if not explicit_explicit_seats:
+            slots.pop("seat_ids", None)
+            slots.pop("seat_labels", None)
+        if not m_price:
+            slots.pop("max_unit_price", None)
+
+    # 8. 判断本轮是否明确发起锁座下单
     wants_commit = any(k in q for k in _COMMIT_KW)
     if "如果" in q and ("推荐" in q or "选两张" in q or "选座" in q) and "下单" not in q:
         wants_commit = False
     slots["wants_commit"] = wants_commit
 
-    # 8. 规则意图识别
+    # 9. 规则意图识别
     intents: List[str] = []
     if any(k in q for k in _POLICY_KW):
         intents.append("policy")
@@ -341,10 +392,25 @@ async def intent_router_node(state: MainGraphState) -> Dict[str, Any]:
 
             llm_slots = parsed.get("slots") or {}
             if isinstance(llm_slots, dict):
+                prev_kw = str(prev_slots.get("show_keyword") or "").strip().lower()
+                llm_kw = str(llm_slots.get("show_keyword") or "").strip()
+                if llm_kw and prev_kw and llm_kw.lower() != prev_kw and not merged_slots.get("seat_ids"):
+                    _reset_stale_show_slots(merged_slots)
                 for k in ("show_keyword", "category", "session_id", "seat_count", "max_unit_price", "order_no"):
                     val = llm_slots.get(k)
-                    if val is not None and val != "":
-                        merged_slots[k] = val
+                    if val is None or val == "":
+                        continue
+                    if (
+                        k == "seat_count"
+                        and prev_slots.get("seat_count") is not None
+                        and not re.search(r"[1-6一两二三四五六]|张|个人|位", query)
+                    ):
+                        continue
+                    merged_slots[k] = val
+                rule_pref_hit = any(k in query for k in _CHEAPER_KW) or any(k in query.lower() for k in _HIGHER_KW)
+                llm_pref = llm_slots.get("price_preference")
+                if not rule_pref_hit and llm_pref in ("best_view", "lowest_price", "highest_price"):
+                    merged_slots["price_preference"] = llm_pref
                 if isinstance(llm_slots.get("seat_ids"), list) and llm_slots["seat_ids"]:
                     merged_slots["seat_ids"] = [int(x) for x in llm_slots["seat_ids"]]
                 if isinstance(llm_slots.get("wants_commit"), bool):
@@ -381,6 +447,10 @@ async def intent_router_node(state: MainGraphState) -> Dict[str, Any]:
         slot_notes.append(f"{merged_slots['seat_count']} 张")
     if merged_slots.get("max_unit_price"):
         slot_notes.append(f"单价 ≤ ¥{int(merged_slots['max_unit_price'])}")
+    if merged_slots.get("price_preference") == "lowest_price":
+        slot_notes.append("偏好低价优先")
+    elif merged_slots.get("price_preference") == "highest_price":
+        slot_notes.append("偏好 VIP 优先")
     if merged_slots.get("seat_ids"):
         slot_notes.append(f"席位 ID {merged_slots['seat_ids']}")
     if merged_slots.get("order_no"):

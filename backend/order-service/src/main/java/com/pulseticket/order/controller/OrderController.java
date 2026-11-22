@@ -21,6 +21,14 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
+/**
+ * 订单中心与交易控制 REST 入口（服务端口 :8203）。
+ *
+ * 【同时服务两端流量】：
+ * 1. Vue 前端（经 ticket-gateway 验签 JWT 后透传 UserContext）
+ * 2. Python LangGraph Agent（用户点选确定性确认卡片后，携 Idempotency-Key 调用）
+ * 所有创单、支付、取消、退票及座位释放均以本服务 Java 强一致性状态机与 Seata AT 事务为准。
+ */
 @RestController
 @RequestMapping("/api/order")
 @RequiredArgsConstructor
