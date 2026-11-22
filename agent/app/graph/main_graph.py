@@ -15,7 +15,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 from app.config import settings
-from app.graph.guard_and_router import input_guard_node, intent_router_node
+from app.graph.guard_and_router import input_guard_node, intent_router_node, summarize_and_trim_history
 from app.graph.state import MainGraphState, SubTaskResult, get_chat_llm
 from app.graph.thought_stream import ThoughtSession, astream_llm_text, emit_thought, emit_tool_card
 from app.graph.subgraphs import (
@@ -179,22 +179,46 @@ async def run_order_subgraph(state: MainGraphState, config: RunnableConfig) -> D
 
 
 async def chitchat_node(state: MainGraphState) -> Dict[str, Any]:
-    """闲聊与能力引导节点（不绑定任何业务工具）"""
+    """闲聊与能力引导节点（携带近 3 轮滑动窗口记忆，不绑定任何业务工具）"""
     q = state.get("current_query") or ""
+    _, recent_prior = summarize_and_trim_history(
+        state.get("messages") or [],
+        state.get("history_summary") or "",
+    )
+
+    if recent_prior:
+        guidance = (
+            "结合上文近期对话记住用户提到的称呼、姓名、偏好等信息，直接、自然、简洁地衔接回答，"
+            "无需每次重复播报三大功能菜单；如用户询问票务需求再顺带引导即可。"
+        )
+    else:
+        guidance = (
+            "请礼貌、简洁地回应用户的问候或闲聊（若用户介绍了姓名请亲切记住并称呼），并简要告知你可以协助：\n"
+            "1. 查询在售演出与智能推荐中间连座；\n"
+            "2. 解答退改手续费、实名入场、场馆地铁与寄存规则；\n"
+            "3. 查询个人订单、核算退票费用或取消未支付锁座单。"
+        )
+
     sys_msg = (
         "你是 PulseTicket（智脉票务平台）的官方 AI 购票与客服助手。\n"
-        "请礼貌、简洁地回应用户的问候或闲聊，并简要告知你可以协助：\n"
-        "1. 查询在售演出与智能推荐中间连座；\n"
-        "2. 解答退改手续费、实名入场、场馆地铁与寄存规则；\n"
-        "3. 查询个人订单、核算退票费用或取消未支付锁座单。"
+        + guidance
     )
+    max_chars = max(50, settings.LLM_CONTEXT_ASSISTANT_MAX_CHARS)
+    llm_msgs: List[Any] = [SystemMessage(content=sys_msg)]
+    for m in recent_prior:
+        if isinstance(m, AIMessage):
+            txt = str(m.content or "").strip()
+            if len(txt) > max_chars:
+                txt = txt[:max_chars] + "…"
+            llm_msgs.append(AIMessage(content=txt))
+        else:
+            llm_msgs.append(HumanMessage(content=str(m.content or "")))
+    llm_msgs.append(HumanMessage(content=q))
+
     try:
         raw_reply = await astream_llm_text(
             get_chat_llm(temperature=0.3),
-            [
-                SystemMessage(content=sys_msg),
-                HumanMessage(content=q),
-            ],
+            llm_msgs,
         )
         reply = raw_reply.strip()
     except Exception:

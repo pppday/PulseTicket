@@ -276,6 +276,9 @@ async def generate_answer_node(state: KnowledgeSubState) -> Dict[str, Any]:
         + uncovered_note
     )
 
+    recent_ctx = (state.get("history_summary") or "").strip()
+    history_block = f"【最近 3 轮对话上下文】:\n{recent_ctx}\n\n" if recent_ctx else ""
+
     answer_text = ""
     try:
         llm = get_chat_llm(temperature=0.1)
@@ -283,7 +286,7 @@ async def generate_answer_node(state: KnowledgeSubState) -> Dict[str, Any]:
             llm,
             [
                 SystemMessage(content=sys_prompt),
-                HumanMessage(content=f"【检索证据】:\n{evidence_text}\n\n【用户问题】:\n{raw_q}"),
+                HumanMessage(content=f"{history_block}【检索证据】:\n{evidence_text}\n\n【用户问题】:\n{raw_q}"),
             ],
         )
         answer_text = raw_ans.strip()

@@ -16,6 +16,7 @@ os.environ["DEV_MOCK"] = "false"
 
 from app.graph import guard_and_router as gr_mod  # noqa: E402
 from app.graph.guard_and_router import extract_deterministic_signals  # noqa: E402
+from app.graph import main_graph as mg_mod  # noqa: E402
 from app.graph.main_graph import MultiAgentTicketManager  # noqa: E402
 from app.graph.subgraphs import knowledge as kg_mod  # noqa: E402
 from app.graph.subgraphs import purchase as pur_mod  # noqa: E402
@@ -206,6 +207,43 @@ class TestStreamingAndModes(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(assistant_msg["mode"], "agent")
         self.assertTrue(any(c["toolName"] == "recommend_seats" for c in assistant_msg["toolCards"]))
         self.assertTrue(any(w["widgetType"] == "SEAT_PICKER" for w in assistant_msg["widgets"]))
+
+    async def test_5_chitchat_node_receives_three_turn_history_context(self):
+        captured_calls = []
+
+        class CaptureChitchatLLM:
+            async def ainvoke(self, msgs):
+                captured_calls.append(list(msgs))
+                return AIMessage(content="您叫 ppday。" if len(captured_calls) > 1 else "您好，ppday！")
+
+        router_llm = FakeStaticLLM('{"intents": ["chitchat"], "slots": {}}')
+        chitchat_llm = CaptureChitchatLLM()
+
+        with patch.object(gr_mod, "get_chat_llm", return_value=router_llm), \
+             patch.object(mg_mod, "get_chat_llm", return_value=chitchat_llm):
+            r1 = await self.manager.chat(
+                thread_id="th-mem-chat",
+                user_message="我叫ppday",
+                user_id=1001,
+                username="zhaolan",
+                mode="chat",
+            )
+            r2 = await self.manager.chat(
+                thread_id="th-mem-chat",
+                user_message="我叫什么名字",
+                user_id=1001,
+                username="zhaolan",
+                mode="chat",
+            )
+
+        self.assertIn("ppday", r1["reply"])
+        self.assertIn("ppday", r2["reply"])
+        self.assertEqual(len(captured_calls), 2)
+        turn2_contents = [str(getattr(m, "content", "")) for m in captured_calls[1]]
+        self.assertTrue(
+            any("我叫ppday" in c for c in turn2_contents),
+            f"Turn 2 chitchat prompt missing Turn 1 history: {turn2_contents}",
+        )
 
 
 if __name__ == "__main__":
