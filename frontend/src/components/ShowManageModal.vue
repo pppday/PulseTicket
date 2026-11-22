@@ -56,6 +56,13 @@ const reordering = ref(false)
 const loadingList = ref(false)
 const fileInput = ref<HTMLInputElement | null>(null)
 
+function defaultStartTimeLocal(daysAhead = 14): string {
+  const d = new Date(Date.now() + daysAhead * 86400000)
+  d.setHours(19, 30, 0, 0)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
 const form = reactive({
   id: 0 as number,
   title: '',
@@ -73,6 +80,7 @@ const form = reactive({
   status: 'ON_SALE',
   description: '',
   sessionTitle: '',
+  startTime: defaultStartTimeLocal(),
   hallName: '中央全息环形演艺厅'
 })
 
@@ -195,7 +203,8 @@ function fillFormFromShow(s?: ShowInfo | null) {
     form.hotScore = 10000
     form.status = 'ON_SALE'
     form.description = '融合先锋声学空间与高规格舞美视效，支持在线实时选座与电子票核验。'
-    form.sessionTitle = '12月24日 周四 19:30 平安夜黄金场'
+    form.sessionTitle = '首演黄金场'
+    form.startTime = defaultStartTimeLocal(14)
     form.hallName = defaultVenue?.hallName || '中央全息环形演艺厅'
     return
   }
@@ -216,6 +225,7 @@ function fillFormFromShow(s?: ShowInfo | null) {
   form.status = s.status || 'ON_SALE'
   form.description = s.description || ''
   form.sessionTitle = ''
+  form.startTime = defaultStartTimeLocal(14)
   const matchedVenue = dbOptions.value.venues.find(v => v.venueName === s.venueName)
   form.hallName = matchedVenue?.hallName || '中央全息环形演艺厅'
 }
@@ -368,6 +378,7 @@ async function saveShow() {
         status: form.status,
         description: form.description,
         sessionTitle: form.sessionTitle,
+        startTime: form.startTime,
         hallName: form.hallName
       })
     })
@@ -945,13 +956,21 @@ async function removeShow(item: ShowInfo) {
                 <p class="text-xs font-semibold text-ink">
                   {{ isNewMode ? '首演场次配置（保存时自动初始化 48 个分区座位库存）' : '追加新场次（留空则仅修改上方演出资料，填写则新增一场 48 座排期）' }}
                 </p>
-                <div class="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <div class="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-3">
                   <div>
-                    <label class="block text-[11px] text-ink-mute">场次排期名称</label>
+                    <label class="block text-[11px] text-ink-mute">开演日期时间（真实落库）</label>
+                    <input
+                      v-model="form.startTime"
+                      type="datetime-local"
+                      class="mt-1 w-full rounded-xl border border-line bg-white px-2.5 py-1.5 text-xs text-ink outline-none focus:border-ink"
+                    />
+                  </div>
+                  <div>
+                    <label class="block text-[11px] text-ink-mute">场次标题后缀（自动拼接日期）</label>
                     <input
                       v-model="form.sessionTitle"
                       type="text"
-                      placeholder="例如：12月31日 周四 21:30 跨年零点专场"
+                      placeholder="例如：跨年零点专场 / 首演黄金场"
                       class="mt-1 w-full rounded-xl border border-line bg-white px-3 py-1.5 text-xs text-ink outline-none focus:border-ink"
                     />
                   </div>

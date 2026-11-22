@@ -39,7 +39,7 @@ public interface SeatInventoryMapper extends BaseMapper<SeatInventory> {
     );
 
     /**
-     * 超时未支付关单或主动取消时：幂等释放 LOCKED -> AVAILABLE
+     * 超时未支付关单或取消时：幂等释放 LOCKED -> AVAILABLE
      */
     @Update("""
             UPDATE seat_inventory
@@ -53,6 +53,23 @@ public interface SeatInventoryMapper extends BaseMapper<SeatInventory> {
               AND status = 'LOCKED'
             """)
     int releaseLockedSeatsByOrder(@Param("sessionId") Long sessionId, @Param("orderNo") String orderNo);
+
+    /**
+     * 已支付订单自助退票时：幂等释放 SOLD/LOCKED -> AVAILABLE
+     */
+    @Update("""
+            UPDATE seat_inventory
+            SET status = 'AVAILABLE',
+                locked_order_no = NULL,
+                locked_user_id = NULL,
+                locked_at = NULL,
+                sold_at = NULL,
+                version = version + 1
+            WHERE session_id = #{sessionId}
+              AND locked_order_no = #{orderNo}
+              AND status IN ('LOCKED', 'SOLD')
+            """)
+    int releaseSoldSeatsByOrder(@Param("sessionId") Long sessionId, @Param("orderNo") String orderNo);
 
     /**
      * 订单支付成功后：幂等将 LOCKED -> SOLD

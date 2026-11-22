@@ -264,6 +264,18 @@ def _format_write_receipt(action_name: str, exec_res: Dict[str, Any], exec_args:
             + mock_banner
         )
 
+    if action_name == "propose_refund_order":
+        return (
+            f"✅ **退票申请已办结，原已售座位已释放**\n\n"
+            f"- **订单号**：`{exec_res.get('orderNo')}`\n"
+            f"- **适用档位**：{exec_res.get('tierName') or exec_args.get('tier_name') or '阶梯退票'} `[POL-REFUND-001]`\n"
+            f"- **订单实付**：¥{exec_res.get('totalAmount', exec_args.get('total_amount'))}\n"
+            f"- **退票手续费**：¥{exec_res.get('feeAmount', exec_args.get('fee_amount'))}（费率 {exec_res.get('feeRate', exec_args.get('fee_rate'))}）\n"
+            f"- **实退金额**：**¥{exec_res.get('refundAmount', exec_args.get('refund_amount'))}**（原路退回）\n"
+            f"- **当前状态**：`{exec_res.get('status', 'CLOSED')}`（原因：`{exec_res.get('closeReason') or 'USER_REFUND'}`，对应席位已恢复为可售状态）"
+            + mock_banner
+        )
+
     return (
         f"✅ **未支付订单已取消，锁定座位已释放**\n\n"
         f"- **订单号**：`{exec_res.get('orderNo')}`\n"
@@ -321,11 +333,12 @@ async def confirm_action_node(state: MainGraphState) -> Dict[str, Any]:
         }
 
     exec_card_id = f"tool-exec-{t_name}"
-    exec_card_title = (
-        "执行分布式锁座下单 (Redisson + Seata AT)"
-        if t_name == "propose_create_order"
-        else "执行未支付订单取消与座位释放"
-    )
+    if t_name == "propose_create_order":
+        exec_card_title = "执行分布式锁座下单 (Redisson + Seata AT)"
+    elif t_name == "propose_refund_order":
+        exec_card_title = "执行已支付订单阶梯退票与座位释放"
+    else:
+        exec_card_title = "执行未支付订单取消与座位释放"
     emit_thought(
         key="confirm-exec",
         phase="confirm",
@@ -340,7 +353,7 @@ async def confirm_action_node(state: MainGraphState) -> Dict[str, Any]:
         tool_name=t_name,
         title=exec_card_title,
         status="running",
-        summary="正在携带幂等键调用 Java order-service 事务下单/关单…",
+        summary="正在携带幂等键调用 Java order-service 事务下单/退票关单…",
         input_data={"idempotencyKey": idempotency_key, **exec_args},
     )
     token = current_user_ctx.set({
@@ -370,20 +383,23 @@ async def confirm_action_node(state: MainGraphState) -> Dict[str, Any]:
         badges=[str(exec_res.get("orderNo") or "FAILED")],
         status="done" if exec_res.get("success") else "warn",
     )
+    if not exec_res.get("success"):
+        card_done_summary = str(exec_res.get("message") or "后端服务处理失败")
+    elif t_name == "propose_create_order":
+        card_done_summary = f"已创建锁座订单 {exec_res.get('orderNo')}（总额 ¥{exec_res.get('totalAmount')}）"
+    elif t_name == "propose_refund_order":
+        card_done_summary = (
+            f"订单 {exec_res.get('orderNo')} 已退票，实退 ¥{exec_res.get('refundAmount')}"
+            f"（手续费 ¥{exec_res.get('feeAmount')}）"
+        )
+    else:
+        card_done_summary = f"已取消订单 {exec_res.get('orderNo')} 并释放座位"
     emit_tool_card(
         card_id=exec_card_id,
         tool_name=t_name,
         title=exec_card_title,
         status="done" if exec_res.get("success") else "error",
-        summary=(
-            f"已创建锁座订单 {exec_res.get('orderNo')}（总额 ¥{exec_res.get('totalAmount')}）"
-            if t_name == "propose_create_order" and exec_res.get("success")
-            else (
-                f"已取消订单 {exec_res.get('orderNo')} 并释放座位"
-                if exec_res.get("success")
-                else str(exec_res.get("message") or "后端服务处理失败")
-            )
-        ),
+        summary=card_done_summary,
         input_data={"idempotencyKey": idempotency_key, **exec_args},
         output_data=exec_res,
     )
@@ -398,8 +414,14 @@ async def confirm_action_node(state: MainGraphState) -> Dict[str, Any]:
             "idempotencyKey": idempotency_key,
         },
     })
-    if t_name == "propose_create_order" and exec_res.get("success") and "POL-LOCK-004" not in citations:
-        citations.append("POL-LOCK-004")
+    new_citations: List[str] = []
+    if t_name == "propose_create_order" and exec_res.get("success"):
+        new_citations.append("POL-LOCK-004")
+    elif t_name == "propose_refund_order" and exec_res.get("success"):
+        new_citations.append("POL-REFUND-001")
+    for c in new_citations:
+        if c not in citations:
+            citations.append(c)
 
     receipt_text = _format_write_receipt(t_name, exec_res, exec_args)
     return {
@@ -410,7 +432,7 @@ async def confirm_action_node(state: MainGraphState) -> Dict[str, Any]:
             "intent": "confirm",
             "agent": "confirm_gate",
             "summary": receipt_text,
-            "citations": ["POL-LOCK-004"] if t_name == "propose_create_order" and exec_res.get("success") else [],
+            "citations": new_citations,
             "refused": False,
         }],
     }
@@ -769,6 +791,14 @@ class MultiAgentTicketManager:
                 f"- 席位：**{seats_str}**\n"
                 f"- 服务端核定总价：**¥{args.get('total_amount')}**{mock_hint}\n\n"
                 "请在下方确认卡片点击【确认锁座下单】完成锁定："
+            )
+        elif confirmation_card.get("actionType") == "REFUND_ORDER":
+            card_prompt = (
+                f"已核实已出票订单 **{args.get('order_no')}**（《{args.get('show_title')}》），按 `[POL-REFUND-001]` 核算明细如下：\n"
+                f"- 适用档位：{args.get('tier_name')}\n"
+                f"- 原实付金额：¥{args.get('total_amount')} · 手续费：**¥{args.get('fee_amount')}（{args.get('fee_rate')}）**\n"
+                f"- 预计实退金额：**¥{args.get('refund_amount')}**{mock_hint}\n\n"
+                "请在下方确认卡片点击【确认申请退票】，办结后将同步释放原已售座位："
             )
         else:
             card_prompt = (

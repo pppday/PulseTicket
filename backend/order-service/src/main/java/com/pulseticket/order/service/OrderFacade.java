@@ -29,6 +29,7 @@ import org.springframework.stereotype.Service;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.sql.SQLIntegrityConstraintViolationException;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
@@ -383,6 +384,132 @@ public class OrderFacade {
         throw new BizException(409, "订单状态已变更，无法取消（当前状态: " + (latest != null ? latest.getStatus() : "UNKNOWN") + "）");
     }
 
+    /**
+     * 已支付出票订单自助阶梯退票 [POL-REFUND-001]：
+     * - >= 168h (7天): 0% 手续费
+     * - 48h ~ 168h: 10% 手续费
+     * - 24h ~ 48h: 20% 手续费
+     * - < 24h 或已开演: 拒绝自助退票 (409)
+     */
+    public Map<String, Object> refundPaidOrder(Long userId, String orderNo) {
+        if (userId == null) {
+            throw new BizException(401, "请先登录后再申请退票");
+        }
+        TicketOrder order = ticketOrderMapper.selectOne(
+                new LambdaQueryWrapper<TicketOrder>()
+                        .eq(TicketOrder::getOrderNo, orderNo)
+                        .eq(TicketOrder::getUserId, userId)
+        );
+        if (order == null) {
+            throw new BizException(404, "订单不存在");
+        }
+        if ("CLOSED".equals(order.getStatus()) && "USER_REFUND".equals(order.getCloseReason())) {
+            return buildRefundReceipt(order, computeTieredRefund(order.getTotalAmount(), order.getStartTime(), false));
+        }
+        if (!"PAID".equals(order.getStatus())) {
+            throw new BizException(409, "仅已支付出票（PAID）订单支持自助退票，未支付订单请使用取消接口");
+        }
+
+        Map<String, Object> quote = computeTieredRefund(order.getTotalAmount(), order.getStartTime(), true);
+        int closed = ticketOrderMapper.casRefundPaidOrder(orderNo, userId, "USER_REFUND");
+        if (closed == 1) {
+            List<Long> seatIds = parseList(order.getSeatIdsJson(), new TypeReference<List<Long>>() {});
+            OrderClosedEventDTO releaseEvent = new OrderClosedEventDTO();
+            String msgId = "msg-refund-" + UUID.randomUUID().toString().substring(0, 8);
+            releaseEvent.setMessageId(msgId);
+            releaseEvent.setOrderNo(orderNo);
+            releaseEvent.setUserId(userId);
+            releaseEvent.setSessionId(order.getSessionId());
+            releaseEvent.setSeatIds(seatIds);
+            releaseEvent.setCloseReason("USER_REFUND");
+
+            rabbitTemplate.convertAndSend(
+                    OrderMqConfigAndListener.EXCHANGE_ORDER_CLOSED_DIRECT,
+                    OrderMqConfigAndListener.ROUTING_ORDER_CLOSED_RELEASE,
+                    releaseEvent
+            );
+            try {
+                showSeatClient.releaseSeats(releaseEvent);
+            } catch (Exception ignored) {
+            }
+
+            seataAuditService.recordMqEvent(
+                    msgId,
+                    OrderMqConfigAndListener.EXCHANGE_ORDER_CLOSED_DIRECT,
+                    OrderMqConfigAndListener.ROUTING_ORDER_CLOSED_RELEASE,
+                    orderNo,
+                    "ORDER_REFUNDED",
+                    "用户自助退票（手续费 " + quote.get("feeRate") + "，实退 ¥" + quote.get("refundAmount")
+                            + "）：通知 show-service 释放已售座位 (SOLD->AVAILABLE)",
+                    "DELIVERED"
+            );
+
+            TicketOrder latest = ticketOrderMapper.selectById(order.getId());
+            return buildRefundReceipt(latest != null ? latest : order, quote);
+        }
+
+        TicketOrder latest = ticketOrderMapper.selectById(order.getId());
+        if (latest != null && "CLOSED".equals(latest.getStatus()) && "USER_REFUND".equals(latest.getCloseReason())) {
+            return buildRefundReceipt(latest, computeTieredRefund(latest.getTotalAmount(), latest.getStartTime(), false));
+        }
+        throw new BizException(409, "订单状态已变更，无法办理退票（当前状态: " + (latest != null ? latest.getStatus() : "UNKNOWN") + "）");
+    }
+
+    private Map<String, Object> computeTieredRefund(BigDecimal totalAmount, LocalDateTime startTime, boolean enforceWindow) {
+        if (startTime == null) {
+            throw new BizException(409, "该订单缺少开演时间信息，请联系人工客服核实退票");
+        }
+        BigDecimal total = (totalAmount != null ? totalAmount : BigDecimal.ZERO).setScale(2, RoundingMode.HALF_UP);
+        double hoursBeforeStart = Duration.between(LocalDateTime.now(), startTime).toSeconds() / 3600.0;
+        if (enforceWindow && hoursBeforeStart < 24.0) {
+            throw new BizException(409, "当前距离演出开演已不足 24 小时（或已开演），按 [POL-REFUND-001] 规定已进入停止退票期，暂不支持自助退票");
+        }
+
+        BigDecimal rate;
+        String feeRate;
+        String tierName;
+        if (hoursBeforeStart >= 168.0) {
+            rate = BigDecimal.ZERO;
+            feeRate = "0%";
+            tierName = "无条件免费退票期（距开演 ≥ 168 小时 / 7 天）";
+        } else if (hoursBeforeStart >= 48.0) {
+            rate = new BigDecimal("0.10");
+            feeRate = "10%";
+            tierName = "标准退票期（距开演 48h ~ 168h，收取 10% 手续费）";
+        } else if (hoursBeforeStart >= 24.0) {
+            rate = new BigDecimal("0.20");
+            feeRate = "20%";
+            tierName = "临期退票期（距开演 24h ~ 48h，收取 20% 手续费）";
+        } else {
+            rate = BigDecimal.ZERO;
+            feeRate = "0%";
+            tierName = "历史已退票归档";
+        }
+
+        BigDecimal feeAmount = total.multiply(rate).setScale(2, RoundingMode.HALF_UP);
+        BigDecimal refundAmount = total.subtract(feeAmount).setScale(2, RoundingMode.HALF_UP);
+
+        Map<String, Object> quote = new LinkedHashMap<>();
+        quote.put("policyCode", "POL-REFUND-001");
+        quote.put("hoursBeforeStart", BigDecimal.valueOf(hoursBeforeStart).setScale(2, RoundingMode.HALF_UP));
+        quote.put("tierName", tierName);
+        quote.put("feeRate", feeRate);
+        quote.put("totalAmount", total);
+        quote.put("feeAmount", feeAmount);
+        quote.put("refundAmount", refundAmount);
+        return quote;
+    }
+
+    private Map<String, Object> buildRefundReceipt(TicketOrder order, Map<String, Object> quote) {
+        Map<String, Object> receipt = new LinkedHashMap<>();
+        receipt.put("order", order);
+        receipt.put("orderNo", order.getOrderNo());
+        receipt.put("status", order.getStatus());
+        receipt.put("closeReason", order.getCloseReason());
+        receipt.putAll(quote);
+        return receipt;
+    }
+
     public List<TicketOrder> listUserOrders(Long userId) {
         return ticketOrderMapper.selectList(
                 new LambdaQueryWrapper<TicketOrder>()
@@ -435,6 +562,7 @@ public class OrderFacade {
         int closedOrders = 0;
         int timeoutClosedOrders = 0;
         int userCancelledOrders = 0;
+        int refundedOrders = 0;
 
         BigDecimal paidRevenue = BigDecimal.ZERO;
         BigDecimal unpaidAmount = BigDecimal.ZERO;
@@ -496,6 +624,8 @@ public class OrderFacade {
                     timeoutClosedOrders++;
                 } else if ("USER_CANCEL".equals(o.getCloseReason())) {
                     userCancelledOrders++;
+                } else if ("USER_REFUND".equals(o.getCloseReason())) {
+                    refundedOrders++;
                 }
             }
         }
@@ -522,6 +652,7 @@ public class OrderFacade {
         summary.put("closedAmount", closedAmount);
         summary.put("timeoutClosedOrders", timeoutClosedOrders);
         summary.put("userCancelledOrders", userCancelledOrders);
+        summary.put("refundedOrders", refundedOrders);
         summary.put("conversionRate", conversionRate);
 
         Map<String, Object> data = new LinkedHashMap<>();

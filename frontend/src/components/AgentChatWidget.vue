@@ -1313,6 +1313,20 @@ async function handleCardDecision(msg: AgentChatMessage, confirmed: boolean) {
                     关联单号：{{ msg.confirmationCard.args.order_no }}
                   </p>
 
+                  <div
+                    v-if="msg.confirmationCard.actionType === 'REFUND_ORDER'"
+                    class="mt-2.5 space-y-1 rounded-xl border border-brick/20 bg-brick-soft/35 px-3 py-2 text-[11px]"
+                  >
+                    <p class="font-medium text-ink">
+                      {{ msg.confirmationCard.args.tier_name || '阶梯退票 [POL-REFUND-001]' }}
+                    </p>
+                    <p class="text-ink-soft tabular">
+                      原实付 ¥{{ money(Number(msg.confirmationCard.args.total_amount || 0)) }} · 手续费（{{
+                        msg.confirmationCard.args.fee_rate || '0%'
+                      }}）¥{{ money(Number(msg.confirmationCard.args.fee_amount || 0)) }}
+                    </p>
+                  </div>
+
                   <!-- Perforated Stub Divider -->
                   <div class="relative my-3.5 border-t border-dashed border-line">
                     <span class="absolute -left-6 -top-2 h-4 w-4 rounded-full border border-line bg-[#FCFBF9]" />
@@ -1321,15 +1335,28 @@ async function handleCardDecision(msg: AgentChatMessage, confirmed: boolean) {
 
                   <div class="flex items-baseline justify-between">
                     <div>
-                      <span class="block text-[10.5px] text-ink-mute">服务端权威核定总额</span>
+                      <span class="block text-[10.5px] text-ink-mute">
+                        {{ msg.confirmationCard.actionType === 'REFUND_ORDER' ? '预计原路实退金额' : '服务端权威核定总额' }}
+                      </span>
                       <span class="mt-0.5 block max-w-[200px] truncate font-mono text-[10px] text-ink-mute">
                         幂等键 {{ msg.confirmationCard.idempotencyKey }}
                       </span>
                     </div>
-                    <div class="text-right tabular">
-                      <span class="text-xs text-ink-soft">¥</span>
-                      <span class="text-xl font-semibold tracking-tight text-ink">
-                        {{ money(Number(msg.confirmationCard.args.total_amount || 0)) }}
+                    <div
+                      class="text-right tabular"
+                      :class="msg.confirmationCard.actionType === 'REFUND_ORDER' ? 'text-brick' : 'text-ink'"
+                    >
+                      <span class="text-xs opacity-75">¥</span>
+                      <span class="text-xl font-semibold tracking-tight">
+                        {{
+                          money(
+                            Number(
+                              msg.confirmationCard.actionType === 'REFUND_ORDER'
+                                ? (msg.confirmationCard.args.refund_amount ?? msg.confirmationCard.args.total_amount ?? 0)
+                                : (msg.confirmationCard.args.total_amount || 0)
+                            )
+                          )
+                        }}
                       </span>
                     </div>
                   </div>
@@ -1347,11 +1374,22 @@ async function handleCardDecision(msg: AgentChatMessage, confirmed: boolean) {
                     <button
                       type="button"
                       class="btn-primary h-9 flex-[1.5] px-0 text-xs"
-                      :class="msg.confirmationCard.actionType === 'CANCEL_ORDER' ? '!bg-brick hover:!bg-[#9c3a22]' : ''"
+                      :class="
+                        msg.confirmationCard.actionType === 'CANCEL_ORDER' ||
+                        msg.confirmationCard.actionType === 'REFUND_ORDER'
+                          ? '!bg-brick hover:!bg-[#9c3a22]'
+                          : ''
+                      "
                       :disabled="sending"
                       @click="handleCardDecision(msg, true)"
                     >
-                      {{ msg.confirmationCard.actionType === 'CREATE_ORDER' ? '确认锁座下单' : '确认取消订单' }}
+                      {{
+                        msg.confirmationCard.actionType === 'CREATE_ORDER'
+                          ? '确认锁座下单'
+                          : msg.confirmationCard.actionType === 'REFUND_ORDER'
+                            ? '确认申请退票'
+                            : '确认取消订单'
+                      }}
                     </button>
                   </div>
 
@@ -1378,7 +1416,13 @@ async function handleCardDecision(msg: AgentChatMessage, confirmed: boolean) {
                     <CheckCircle2 v-if="msg.cardDecision === 'CONFIRMED'" class="h-3.5 w-3.5" />
                     {{
                       msg.cardDecision === 'CONFIRMED'
-                        ? `已选择：${msg.confirmationCard.actionType === 'CREATE_ORDER' ? '确认锁座下单' : '确认取消订单'}（单次防重锁定生效）`
+                        ? `已选择：${
+                            msg.confirmationCard.actionType === 'CREATE_ORDER'
+                              ? '确认锁座下单'
+                              : msg.confirmationCard.actionType === 'REFUND_ORDER'
+                                ? '确认申请退票'
+                                : '确认取消订单'
+                          }（单次防重锁定生效）`
                         : '已选择：暂不执行'
                     }}
                   </div>

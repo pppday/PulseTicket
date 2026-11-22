@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { cancelOrder, payOrder, state } from '../store'
-import type { OrderStatus } from '../types'
-import { closeReasonLabel, countdown, money, parseList, remainingSeconds, shortTime } from '../utils'
+import { cancelOrder, payOrder, refundOrder, state } from '../store'
+import type { OrderStatus, TicketOrder } from '../types'
+import { calcRefundPreview, closeReasonLabel, countdown, money, parseList, remainingSeconds, shortTime } from '../utils'
 
 const filter = ref<'ALL' | OrderStatus>('ALL')
 const filters: { key: 'ALL' | OrderStatus; label: string }[] = [
@@ -30,6 +30,25 @@ async function act(orderNo: string, fn: () => Promise<void>) {
   } finally {
     busy.value = null
   }
+}
+
+function previewRefund(order: TicketOrder) {
+  return calcRefundPreview(order.totalAmount, order.startTime, state.now)
+}
+
+async function handleRefund(order: TicketOrder) {
+  const preview = previewRefund(order)
+  if (!preview.refundable) return
+  const ok = window.confirm(
+    `确认对订单 ${order.orderNo} 申请退票？\n` +
+      `适用规则：[POL-REFUND-001] ${preview.tierName}\n` +
+      `订单实付：¥${money(order.totalAmount)}\n` +
+      `手续费（${preview.feeRate}）：¥${money(preview.feeAmount)}\n` +
+      `预计实退金额：¥${money(preview.refundAmount)}\n\n` +
+      `退票后电子核验码将失效，对应座位将立即释放回余票池。`
+  )
+  if (!ok) return
+  await act(order.orderNo, () => refundOrder(order))
 }
 </script>
 
@@ -140,13 +159,27 @@ async function act(orderNo: string, fn: () => Promise<void>) {
                 立即支付
               </button>
             </div>
-            <button
-              v-else-if="order.status === 'PAID'"
-              class="btn-ghost mt-4 h-10 w-full"
-              @click="state.ticket = order"
-            >
-              查看电子票
-            </button>
+            <div v-else-if="order.status === 'PAID'" class="mt-4 space-y-2">
+              <div class="flex gap-2">
+                <button
+                  v-if="previewRefund(order).refundable"
+                  class="btn-ghost h-10 flex-1 border-brick/35 px-0 text-brick hover:bg-brick-soft/50"
+                  :disabled="busy === order.orderNo"
+                  @click="handleRefund(order)"
+                >
+                  {{ busy === order.orderNo ? '退票中…' : `申请退票 (${previewRefund(order).feeRate})` }}
+                </button>
+                <button
+                  class="btn-ghost h-10 flex-1 px-0"
+                  @click="state.ticket = order"
+                >
+                  查看电子票
+                </button>
+              </div>
+              <p v-if="!previewRefund(order).refundable" class="text-[11px] text-ink-mute">
+                {{ previewRefund(order).known ? '距开演不足 24h 或已开演，暂不支持自助退票' : '开演时间待定，请联系客服核实退票' }}
+              </p>
+            </div>
           </div>
         </div>
       </article>

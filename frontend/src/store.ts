@@ -1,5 +1,6 @@
 import { computed, reactive, ref } from 'vue'
 import { api, getToken, readableMessage, setToken, setUnauthorizedHandler } from './api'
+import { money } from './utils'
 import type {
   AgentTraceItem,
   AgentTraceSummary,
@@ -384,5 +385,26 @@ export async function cancelOrder(order: TicketOrder) {
     return
   }
   toast('info', '订单已取消', '锁定的座位已释放')
+  await refreshAll()
+}
+
+export async function refundOrder(order: TicketOrder) {
+  const res = await api<{
+    refundAmount?: number
+    feeAmount?: number
+    feeRate?: string
+    tierName?: string
+  }>(`/api/order/${order.orderNo}/refund`, { method: 'POST' })
+  if (res.code !== 200) {
+    toast('error', '退票失败', res.message)
+    await loadOrders()
+    return
+  }
+  const d = res.data || {}
+  toast(
+    'success',
+    '退票成功，座位已释放',
+    `实退 ¥${money(d.refundAmount ?? order.totalAmount)}（手续费 ¥${money(d.feeAmount ?? 0)} / ${d.feeRate ?? '0%'}）`
+  )
   await refreshAll()
 }

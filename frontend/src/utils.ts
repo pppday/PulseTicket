@@ -92,12 +92,95 @@ export const cacheLabel: Record<string, string> = {
 
 export const closeReasonLabel: Record<string, string> = {
   TIMEOUT_UNPAID: '超时未支付，座位已释放',
-  USER_CANCEL: '已取消，座位已释放'
+  USER_CANCEL: '已取消，座位已释放',
+  USER_REFUND: '已申请退票退款，座位已释放'
 }
 
 export const mqEventLabel: Record<string, string> = {
   DELAY_CLOSE_SENT: '投递延迟关单',
   TIMEOUT_CLOSED: '超时自动关单',
   TIMEOUT_SKIPPED_PAID: '已支付，跳过关单',
-  ORDER_PAID_FANOUT: '支付成功广播'
+  ORDER_PAID_FANOUT: '支付成功广播',
+  ORDER_REFUNDED: '退票释放座位'
+}
+
+export function hoursUntil(startTime?: string, now = Date.now()): number | null {
+  const d = toDate(startTime)
+  if (!d) return null
+  return (d.getTime() - now) / 3600000
+}
+
+export interface RefundPreview {
+  known: boolean
+  refundable: boolean
+  hoursLeft: number | null
+  feeRate: string
+  tierName: string
+  feeAmount: number
+  refundAmount: number
+}
+
+export function calcRefundPreview(
+  totalAmount: number | string | undefined,
+  startTime?: string,
+  now = Date.now()
+): RefundPreview {
+  const total = Number(totalAmount || 0)
+  const h = hoursUntil(startTime, now)
+  if (h === null) {
+    return {
+      known: false,
+      refundable: false,
+      hoursLeft: null,
+      feeRate: '--',
+      tierName: '开演时间待确认',
+      feeAmount: 0,
+      refundAmount: 0
+    }
+  }
+  const roundedHours = Math.round(h * 10) / 10
+  if (h >= 168) {
+    return {
+      known: true,
+      refundable: true,
+      hoursLeft: roundedHours,
+      feeRate: '0%',
+      tierName: '无条件免费退票期（≥7天）',
+      feeAmount: 0,
+      refundAmount: Number(total.toFixed(2))
+    }
+  }
+  if (h >= 48) {
+    const fee = Math.round(total * 0.1 * 100) / 100
+    return {
+      known: true,
+      refundable: true,
+      hoursLeft: roundedHours,
+      feeRate: '10%',
+      tierName: '标准退票期（48h~168h）',
+      feeAmount: fee,
+      refundAmount: Number((total - fee).toFixed(2))
+    }
+  }
+  if (h >= 24) {
+    const fee = Math.round(total * 0.2 * 100) / 100
+    return {
+      known: true,
+      refundable: true,
+      hoursLeft: roundedHours,
+      feeRate: '20%',
+      tierName: '临期退票期（24h~48h）',
+      feeAmount: fee,
+      refundAmount: Number((total - fee).toFixed(2))
+    }
+  }
+  return {
+    known: true,
+    refundable: false,
+    hoursLeft: roundedHours,
+    feeRate: '不可退',
+    tierName: '距开演不足 24 小时或已开演',
+    feeAmount: total,
+    refundAmount: 0
+  }
 }

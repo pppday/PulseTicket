@@ -33,7 +33,8 @@ _UNCOVERED_TOPICS = {
 
 # 已收录在 5 篇官方规则文档中的核心主题锚点词
 _COVERED_ANCHORS = (
-    "退票", "手续费", "改签", "免费退", "取消", "实名", "身份证", "核验", "检票", "二维码",
+    "退票", "退款", "退单", "退订", "退钱", "全额退", "手续费", "改签", "免费退", "取消",
+    "实名", "身份证", "核验", "检票", "二维码",
     "儿童", "小孩", "身高", "1.2", "迟到", "幕间", "地铁", "怎么走", "路线", "交通", "停车",
     "梅赛德斯", "天桥", "万象城", "大麦", "梅溪湖", "贺龙", "琴岛", "音乐厅",
     "禁带", "雨伞", "长柄伞", "水", "饮料", "打火机", "灯牌", "寄存", "存包",
@@ -70,9 +71,11 @@ async def query_rewrite_node(state: KnowledgeSubState) -> Dict[str, Any]:
     show_kw = slots.get("show_keyword") or ""
     if retry == 0:
         rewritten = f"{show_kw} {policy_focus}".strip() if show_kw and show_kw not in policy_focus else policy_focus
+        if any(k in policy_focus for k in ("退款", "退单", "退订", "退钱", "全额退")) and "退票" not in policy_focus:
+            rewritten = f"{rewritten} 退票 阶梯手续费".strip()
     else:
         # 第 2 次重试：追加规范票务术语扩大召回面
-        rewritten = f"{policy_focus} 票务规则 条款 退改 入场 场馆交通 须知"
+        rewritten = f"{policy_focus} 票务规则 条款 退改 退票 入场 场馆交通 须知"
 
     steps = list(state.get("tool_steps") or [])
     steps.append({

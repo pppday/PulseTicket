@@ -1,20 +1,33 @@
 package com.pulseticket.show.config;
 
+import com.pulseticket.show.service.ShowCacheAndSeatService;
 import lombok.RequiredArgsConstructor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
+
+import java.sql.Timestamp;
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @Component
 @RequiredArgsConstructor
 public class ShowOssSchemaInitializer implements ApplicationRunner {
 
     private static final Logger log = LoggerFactory.getLogger(ShowOssSchemaInitializer.class);
+    private static final Pattern TITLE_DATE_TIME_PATTERN = Pattern.compile(
+            "(\\d{1,2})月(\\d{1,2})日(?:\\s*周[一二三四五六日天])?(?:\\s*(\\d{1,2}):(\\d{2}))?"
+    );
 
     private final JdbcTemplate jdbcTemplate;
+    private final ShowCacheAndSeatService showCacheAndSeatService;
 
     @Override
     public void run(ApplicationArguments args) {
@@ -87,8 +100,85 @@ public class ShowOssSchemaInitializer implements ApplicationRunner {
                     WHERE s.city IS NOT NULL AND s.venue_name IS NOT NULL
                     """
             );
+
+            rollExpiredSessionsToUpcoming();
         } catch (Exception e) {
             log.warn("[ShowOssSchemaInitializer] Schema check warning: {}", e.getMessage());
         }
+    }
+
+    /**
+     * 启动时与每日凌晨自动滚动已过期/临近开演的场次至未来真实日期（覆盖 0% / 10% / 20% 阶梯退票窗）
+     */
+    @Scheduled(cron = "0 15 4 * * *")
+    public void rollExpiredSessionsToUpcoming() {
+        try {
+            LocalDateTime now = LocalDateTime.now();
+            LocalDateTime cutoff = now.plusHours(6);
+            List<Map<String, Object>> sessions = jdbcTemplate.queryForList(
+                    "SELECT id, show_id, session_title, start_time FROM show_session"
+            );
+            int rolledCount = 0;
+            for (Map<String, Object> row : sessions) {
+                Long sessionId = ((Number) row.get("id")).longValue();
+                Long showId = ((Number) row.get("show_id")).longValue();
+                String title = row.get("session_title") != null ? String.valueOf(row.get("session_title")) : "";
+                Timestamp ts = row.get("start_time") instanceof Timestamp t ? t : null;
+                LocalDateTime currentStart = ts != null ? ts.toLocalDateTime() : null;
+
+                if (currentStart == null || currentStart.isBefore(cutoff)) {
+                    LocalDateTime nextStart = computeUpcomingStart(sessionId, title, now, cutoff);
+                    LocalDateTime nextEnd = nextStart.plusHours(2).plusMinutes(30);
+                    String nextTitle = ShowCacheAndSeatService.buildSessionTitleWithSchedule(title, nextStart);
+                    jdbcTemplate.update(
+                            "UPDATE show_session SET start_time = ?, end_time = ?, session_title = ? WHERE id = ?",
+                            Timestamp.valueOf(nextStart),
+                            Timestamp.valueOf(nextEnd),
+                            nextTitle,
+                            sessionId
+                    );
+                    showCacheAndSeatService.evictShowCaches(showId, sessionId);
+                    rolledCount++;
+                }
+            }
+            if (rolledCount > 0) {
+                log.info("[ShowScheduleRoller] Rolled {} expired show_session record(s) to real upcoming dates.", rolledCount);
+            }
+        } catch (Exception e) {
+            log.warn("[ShowScheduleRoller] Failed to roll expired sessions: {}", e.getMessage());
+        }
+    }
+
+    private LocalDateTime computeUpcomingStart(Long sessionId, String title, LocalDateTime now, LocalDateTime cutoff) {
+        if (sessionId == 101L) {
+            return now.plusDays(12).withHour(19).withMinute(30).withSecond(0).withNano(0);
+        }
+        if (sessionId == 102L) {
+            return now.plusDays(13).withHour(19).withMinute(30).withSecond(0).withNano(0);
+        }
+        if (sessionId == 201L) {
+            return now.plusDays(5).withHour(19).withMinute(30).withSecond(0).withNano(0);
+        }
+        if (sessionId == 301L) {
+            return now.plusHours(36).withMinute(0).withSecond(0).withNano(0);
+        }
+        if (sessionId == 401L) {
+            return now.plusDays(8).withHour(20).withMinute(30).withSecond(0).withNano(0);
+        }
+        Matcher m = TITLE_DATE_TIME_PATTERN.matcher(title != null ? title : "");
+        if (m.find()) {
+            try {
+                int month = Integer.parseInt(m.group(1));
+                int day = Integer.parseInt(m.group(2));
+                int hour = m.group(3) != null ? Integer.parseInt(m.group(3)) : 19;
+                int minute = m.group(4) != null ? Integer.parseInt(m.group(4)) : 30;
+                LocalDateTime candidate = LocalDateTime.of(now.getYear(), month, day, hour, minute, 0);
+                if (candidate.isAfter(cutoff)) {
+                    return candidate;
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        return now.plusDays(14).withHour(19).withMinute(30).withSecond(0).withNano(0);
     }
 }

@@ -11,6 +11,7 @@ from app.graph.thought_stream import astream_llm_message, emit_thought, emit_too
 from app.tools.ticket_tools import (
     ORDER_READ_TOOLS,
     ORDER_WRITE_TOOLS,
+    calculate_tiered_refund_quote,
     current_user_ctx,
     inspect_order_for_cancel,
 )
@@ -72,6 +73,7 @@ async def order_agent_node(state: OrderSubState) -> Dict[str, Any]:
     - 查订单调 `list_my_orders`
     - 问某单能退多少钱调 `check_order_refund_detail`（由 Python Decimal 确定性计算手续费，严禁心算！）
     - 取消未支付订单调 `propose_cancel_order`
+    - 已支付且距开演 >= 24h 的订单退票调 `propose_refund_order`
     """
     slots = dict(state.get("slots") or {})
     mode = (state.get("mode") or "agent").strip().lower()
@@ -79,7 +81,8 @@ async def order_agent_node(state: OrderSubState) -> Dict[str, Any]:
     step_count = int(state.get("step_count") or 0)
 
     chat_mode_note = (
-        "\n5. 【当前为 Chat 只读咨询模式】：严禁调用 `propose_cancel_order`，仅查订单与测算退票费；若用户要求取消订单，请友好提示其切换左下角【Agent 模式】操作。"
+        "\n5. 【当前为 Chat 只读咨询模式】：严禁调用 `propose_cancel_order` 与 `propose_refund_order`，"
+        "仅查订单与测算退票费；若用户要求取消或退票，请友好提示其切换左下角【Agent 模式】操作。"
         if is_chat_mode
         else ""
     )
@@ -90,9 +93,10 @@ async def order_agent_node(state: OrderSubState) -> Dict[str, Any]:
         f"【最近 3 轮对话】: {state.get('history_summary') or '无'}\n"
         "职责规范：\n"
         "1. 若用户未提供订单号，先调用 `list_my_orders` 查询用户名下订单；\n"
-        "2. 若用户询问某笔订单退票扣多少手续费、能退多少钱，必须调用 `check_order_refund_detail` 获取代码计算的精确金额，并标注 `[POL-REFUND-001]`，严禁自己心算；\n"
-        "3. 若用户明确要求取消某笔未支付（UNPAID）订单，拿到真实订单号后调用 `propose_cancel_order`；\n"
-        "4. 若订单已支付（PAID），如实附上 `check_order_refund_detail` 算出的阶梯退票明细，并告知线上取消按钮仅支持未支付锁座单，已出票订单请联系人工客服办理退票。"
+        "2. 若用户仅咨询“某单退票扣多少手续费、能退多少钱”而未明确要求退票，调用 `check_order_refund_detail` 获取代码计算的精确金额，并标注 `[POL-REFUND-001]`，严禁自己心算；\n"
+        "3. 若用户明确要求取消某笔未支付（UNPAID）订单（如“取消订单/申请取消”），拿到订单号后直接调用 `propose_cancel_order` 弹出确认卡片，勿先用文字二次追问确认；\n"
+        "4. 若用户明确要求对已支付（PAID）订单办理退票/退款（如“申请退票/退票退款/我要退款”）：\n"
+        "   - 若还未掌握具体订单号，先调用 `list_my_orders`；已有订单号时**直接调用 `propose_refund_order`**（系统会在前置校验节点自动查状态并按 `[POL-REFUND-001]` 核算手续费与实退金额后弹出确认卡片等待用户点击确认；若距开演不足 24h 会自动拦截并交由你向用户说明原因），**不要**用纯文字追问“是否需要发起退票”！"
         + chat_mode_note
     )
 
@@ -197,32 +201,57 @@ async def order_read_tools_node(state: OrderSubState) -> Dict[str, Any]:
                         input_data=t_args,
                         output_data=parsed if parsed is not None else obs_str,
                     )
-                    unpaid = [o for o in orders if str(o.get("status", "")).upper() == "UNPAID"]
-                    if mode != "chat" and unpaid:
+                    if mode != "chat":
                         order_options = []
-                        for o in unpaid[:3]:
-                            ono = str(o.get("orderNo") or "")
-                            seat_txt = o.get("seatLabelsJson") or ""
+                        unpaid = [o for o in orders if str(o.get("status", "")).upper() == "UNPAID"]
+                        paid_list = [o for o in orders if str(o.get("status", "")).upper() == "PAID"]
+
+                        def _fmt_seats(raw_seats: Any) -> str:
+                            seat_txt = raw_seats or ""
                             if isinstance(seat_txt, str) and seat_txt.startswith("["):
                                 try:
-                                    seat_txt = "、".join(json.loads(seat_txt))
+                                    return "、".join(json.loads(seat_txt))
                                 except Exception:
-                                    pass
+                                    return seat_txt
+                            return str(seat_txt)
+
+                        for o in unpaid[:2]:
+                            ono = str(o.get("orderNo") or "")
+                            seat_txt = _fmt_seats(o.get("seatLabelsJson"))
                             order_options.append({
-                                "id": f"order-{ono}",
+                                "id": f"order-cancel-{ono}",
                                 "label": f"{ono} · {o.get('showTitle', '')}",
                                 "badge": "待支付 UNPAID",
                                 "meta": f"{seat_txt} · 应付 ¥{o.get('totalAmount')}".strip(" ·"),
                                 "price": o.get("totalAmount"),
                                 "prompt": f"申请取消未支付订单 {ono}",
                             })
-                        emit_widget(
-                            widget_id=f"widget-orders-{t_id}",
-                            widget_type="ORDER_PICKER",
-                            title="检测到待支付锁座订单 · 支持一键取消释放座位",
-                            subtitle="点击需要取消的订单将先核验状态并弹出确认卡片",
-                            options=order_options,
-                        )
+
+                        for o in paid_list:
+                            if len(order_options) >= 4:
+                                break
+                            calc = calculate_tiered_refund_quote(o.get("totalAmount"), o.get("startTime"))
+                            if not (calc.get("knownStartTime") and calc.get("refundable")):
+                                continue
+                            ono = str(o.get("orderNo") or "")
+                            seat_txt = _fmt_seats(o.get("seatLabelsJson"))
+                            order_options.append({
+                                "id": f"order-refund-{ono}",
+                                "label": f"{ono} · {o.get('showTitle', '')}",
+                                "badge": f"可退 · {calc.get('feeRate')}手续费",
+                                "meta": f"{seat_txt} · 预计实退 ¥{calc.get('refundAmount')}".strip(" ·"),
+                                "price": calc.get("refundAmount"),
+                                "prompt": f"申请退票退款订单 {ono}",
+                            })
+
+                        if order_options:
+                            emit_widget(
+                                widget_id=f"widget-orders-{t_id}",
+                                widget_type="ORDER_PICKER",
+                                title="可操作订单快捷选择 · 支持取消锁座或阶梯退票",
+                                subtitle="点击订单将自动核验状态/退票费率并弹出确认卡片",
+                                options=order_options,
+                            )
                 else:
                     refund_ok = isinstance(parsed, dict) and parsed.get("ok") is not False
                     summary_txt = "阶梯退票费率计算完成"
@@ -262,13 +291,17 @@ async def order_read_tools_node(state: OrderSubState) -> Dict[str, Any]:
 async def verify_cancel_node(state: OrderSubState, config: RunnableConfig) -> Dict[str, Any]:
     """
     【子图 ③ 节点 3：verify_cancel 确定性订单状态核验】：
-    向 Java order-service 核实订单归属与状态：
-    - 仅 UNPAID 订单生成取消确认卡片 pending_action；
-    - PAID 订单返回确定性阶梯手续费核算结果并回退给 order_agent 向用户说明。
+    向 Java order-service 核实订单归属、状态与阶梯退票费率：
+    - UNPAID 订单：生成 CANCEL_ORDER 取消确认卡片 pending_action；
+    - PAID 且距开演 >= 24h 订单：生成 REFUND_ORDER 阶梯退票确认卡片 pending_action；
+    - 不可退或已关闭订单：返回明确核验结果回退给 order_agent 向用户说明。
     """
     last_msg = state["sub_messages"][-1]
     tool_calls = getattr(last_msg, "tool_calls", []) or []
-    write_tc = next((tc for tc in tool_calls if tc["name"] == "propose_cancel_order"), None)
+    write_tc = next(
+        (tc for tc in tool_calls if tc["name"] in ("propose_cancel_order", "propose_refund_order")),
+        None,
+    )
     steps = list(state.get("tool_steps") or [])
     citations = list(state.get("citations") or [])
 
@@ -278,22 +311,33 @@ async def verify_cancel_node(state: OrderSubState, config: RunnableConfig) -> Di
             "pending_action": None,
         }
 
+    req_tool_name = write_tc["name"]
     t_args = write_tc.get("args") or {}
     t_id = write_tc["id"]
     order_no = str(t_args.get("order_no") or "").strip()
-    refund_reason = str(t_args.get("refund_reason") or "用户主动申请取消未支付订单")
+    default_reason = (
+        "用户主动申请已支付订单阶梯退票"
+        if req_tool_name == "propose_refund_order"
+        else "用户主动申请取消未支付订单"
+    )
+    refund_reason = str(t_args.get("refund_reason") or default_reason)
     thread_id = str((config.get("configurable") or {}).get("thread_id") or "")
     idempotency_key = f"{thread_id}:{t_id}" if thread_id else t_id
 
-    steps.append({"agent": "order_agent", "tool": "propose_cancel_order", "args": {"order_no": order_no}})
+    steps.append({"agent": "order_agent", "tool": req_tool_name, "args": {"order_no": order_no}})
 
     verify_card_id = f"tool-verify-cancel-{t_id}"
+    verify_title = (
+        f"核验订单 {order_no} 阶梯退票资格"
+        if req_tool_name == "propose_refund_order"
+        else f"核验订单 {order_no} 取消/退票状态"
+    )
     emit_tool_card(
         card_id=verify_card_id,
         tool_name="verify_order_status",
-        title=f"核验订单 {order_no} 可取消状态",
+        title=verify_title,
         status="running",
-        summary="正在向 Java order-service 核实订单归属与状态…",
+        summary="正在向 Java order-service 核实订单归属、状态与阶梯退票费率…",
         input_data={"order_no": order_no},
     )
 
@@ -313,16 +357,26 @@ async def verify_cancel_node(state: OrderSubState, config: RunnableConfig) -> Di
         "args": {"orderNo": order_no, "ok": bool(check_res.get("ok"))},
     })
 
+    action_type = check_res.get("actionType") or "CANCEL_ORDER"
+    resolved_tool_name = check_res.get("toolName") or (
+        "propose_refund_order" if action_type == "REFUND_ORDER" else "propose_cancel_order"
+    )
+    refund_calc = check_res.get("refundCalc") or {}
+    if check_res.get("ok"):
+        done_summary = (
+            f"状态为 PAID · 命中{refund_calc.get('feeRate', '阶梯')}手续费，预计实退 ¥{refund_calc.get('refundAmount')} · 等待确认"
+            if action_type == "REFUND_ORDER"
+            else "状态为 UNPAID · 允许发起人工取消确认"
+        )
+    else:
+        done_summary = str(check_res.get("message") or "当前状态不支持自助操作")
+
     emit_tool_card(
         card_id=verify_card_id,
         tool_name="verify_order_status",
-        title=f"核验订单 {order_no} 可取消状态",
+        title=verify_title,
         status="done" if check_res.get("ok") else "error",
-        summary=(
-            "状态为 UNPAID · 允许发起人工取消确认"
-            if check_res.get("ok")
-            else str(check_res.get("message") or "当前状态不支持直接取消")
-        ),
+        summary=done_summary,
         input_data={"order_no": order_no},
         output_data=check_res,
     )
@@ -332,8 +386,8 @@ async def verify_cancel_node(state: OrderSubState, config: RunnableConfig) -> Di
             key=f"ord-verify-{t_id}",
             phase="order",
             agent_label="订单售后子图",
-            title=f"取消前置校验拦截（订单 {order_no}）",
-            detail=check_res.get("message", "当前状态不支持直接取消"),
+            title=f"售后前置校验拦截（订单 {order_no}）",
+            detail=check_res.get("message", "当前状态不支持自助退票或取消"),
             badges=[check_res.get("orderStatus") or "拦截"],
             status="warn",
         )
@@ -341,10 +395,10 @@ async def verify_cancel_node(state: OrderSubState, config: RunnableConfig) -> Di
             citations.append("POL-REFUND-001")
         err_msg = ToolMessage(
             content=json.dumps(
-                {"status": "CANCEL_PRECHECK_FAILED", "message": check_res.get("message", "订单状态不支持取消")},
+                {"status": "CANCEL_PRECHECK_FAILED", "message": check_res.get("message", "订单状态不支持取消或退票")},
                 ensure_ascii=False,
             ),
-            name="propose_cancel_order",
+            name=req_tool_name,
             tool_call_id=t_id,
         )
         return {
@@ -355,7 +409,7 @@ async def verify_cancel_node(state: OrderSubState, config: RunnableConfig) -> Di
         }
 
     order_info = check_res["order"]
-    verified_args = {
+    verified_args: Dict[str, Any] = {
         "order_no": order_info["orderNo"],
         "show_title": order_info.get("showTitle", ""),
         "session_title": order_info.get("sessionTitle", ""),
@@ -363,12 +417,27 @@ async def verify_cancel_node(state: OrderSubState, config: RunnableConfig) -> Di
         "total_amount": order_info.get("totalAmount"),
         "refund_reason": refund_reason,
     }
+
+    if action_type == "REFUND_ORDER":
+        if "POL-REFUND-001" not in citations:
+            citations.append("POL-REFUND-001")
+        verified_args.update({
+            "fee_rate": refund_calc.get("feeRate"),
+            "fee_amount": refund_calc.get("feeAmount"),
+            "refund_amount": refund_calc.get("refundAmount"),
+            "tier_name": refund_calc.get("tierName"),
+            "hours_before_start": refund_calc.get("hoursBeforeStart"),
+        })
+        card_title = "确认申请阶梯退票退款"
+    else:
+        card_title = "确认取消未支付订单"
+
     card_payload = {
-        "actionType": "CANCEL_ORDER",
-        "toolName": "propose_cancel_order",
+        "actionType": action_type,
+        "toolName": resolved_tool_name,
         "toolCallId": t_id,
         "idempotencyKey": idempotency_key,
-        "title": "确认取消未支付订单",
+        "title": card_title,
         "isMock": bool(check_res.get("isMock")),
         "args": verified_args,
     }
@@ -376,7 +445,7 @@ async def verify_cancel_node(state: OrderSubState, config: RunnableConfig) -> Di
         "tool_steps": steps,
         "citations": citations,
         "pending_action": {
-            "toolName": "propose_cancel_order",
+            "toolName": resolved_tool_name,
             "toolCallId": t_id,
             "allToolCalls": tool_calls,
             "idempotencyKey": idempotency_key,
@@ -393,7 +462,7 @@ def _route_from_order_agent(state: OrderSubState) -> str:
     tcs = getattr(msgs[-1], "tool_calls", []) or []
     if not tcs:
         return END
-    if any(tc["name"] == "propose_cancel_order" for tc in tcs):
+    if any(tc["name"] in ("propose_cancel_order", "propose_refund_order") for tc in tcs):
         return "verify_cancel"
     return "order_read_tools"
 

@@ -131,6 +131,13 @@ public class OrderController {
         return Result.ok("订单已取消，锁定座位已释放", cancelled);
     }
 
+    @PostMapping("/{orderNo}/refund")
+    public Result<Map<String, Object>> refundOrder(@PathVariable String orderNo) {
+        Long userId = requireUserId();
+        Map<String, Object> receipt = orderFacade.refundPaidOrder(userId, orderNo);
+        return Result.ok("退票申请已办结，座位已释放", receipt);
+    }
+
     @GetMapping("/my")
     public Result<List<TicketOrder>> listMyOrders() {
         Long userId = requireUserId();

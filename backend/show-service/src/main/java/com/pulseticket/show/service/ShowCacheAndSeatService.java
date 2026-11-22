@@ -30,11 +30,14 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.time.DayOfWeek;
 import java.time.Duration;
+import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
 
 @Service
 @RequiredArgsConstructor
@@ -206,6 +209,9 @@ public class ShowCacheAndSeatService {
         if ("OFF_SHELF".equalsIgnoreCase(show.getStatus())) {
             throw new BizException(409, "该演出已下架归档，暂不支持购买");
         }
+        if (session.getStartTime() != null && session.getStartTime().isBefore(LocalDateTime.now())) {
+            throw new BizException(409, "该场次已开演或已结束，停止售票，请选择其他近期场次");
+        }
 
         List<SeatInventory> seats = seatInventoryMapper.selectList(
                 new LambdaQueryWrapper<SeatInventory>()
@@ -293,6 +299,9 @@ public class ShowCacheAndSeatService {
         if (session == null) {
             throw new BizException(404, "场次不存在");
         }
+        if (session.getStartTime() != null && session.getStartTime().isBefore(LocalDateTime.now())) {
+            throw new BizException(409, "该场次已开演或已结束，停止售票，请选择其他近期场次");
+        }
         ShowInfo show = showInfoMapper.selectById(session.getShowId());
 
         int updated = seatInventoryMapper.lockAvailableSeats(
@@ -334,11 +343,13 @@ public class ShowCacheAndSeatService {
     }
 
     /**
-     * 超时未支付关单或取消时幂等释放座位 (LOCKED -> AVAILABLE)
+     * 超时未支付关单、取消或已支付退票时幂等释放座位
      */
     @Transactional(rollbackFor = Exception.class)
     public int releaseSeatsIdempotent(OrderClosedEventDTO dto) {
-        int released = seatInventoryMapper.releaseLockedSeatsByOrder(dto.getSessionId(), dto.getOrderNo());
+        int released = "USER_REFUND".equals(dto.getCloseReason())
+                ? seatInventoryMapper.releaseSoldSeatsByOrder(dto.getSessionId(), dto.getOrderNo())
+                : seatInventoryMapper.releaseLockedSeatsByOrder(dto.getSessionId(), dto.getOrderNo());
         if (released > 0) {
             ShowSession session = showSessionMapper.selectById(dto.getSessionId());
             showSessionMapper.syncSessionSeatCounts(dto.getSessionId());
@@ -744,14 +755,23 @@ public class ShowCacheAndSeatService {
             showInfoMapper.updateById(show);
         }
 
-        String sessionTitle = strVal(payload.get("sessionTitle"), "").trim();
-        if (isNew && sessionTitle.isEmpty()) {
-            sessionTitle = "12月20日 周日 19:30 首演黄金场";
+        LocalDateTime customStartTime = parseFlexibleDateTime(strVal(payload.get("startTime"), null));
+        if (customStartTime != null && customStartTime.isBefore(LocalDateTime.now())) {
+            throw new BizException(400, "场次开演时间必须晚于当前时间");
         }
+        LocalDateTime effectiveStart = customStartTime != null
+                ? customStartTime
+                : LocalDateTime.now().plusDays(14).withHour(19).withMinute(30).withSecond(0).withNano(0);
+
+        String rawSessionTitle = strVal(payload.get("sessionTitle"), "").trim();
         String hallName = strVal(payload.get("hallName"), "中央全息沉浸演艺厅");
         ShowSession createdSession = null;
-        if (!sessionTitle.isEmpty()) {
-            createdSession = createSessionWithSeats(show, sessionTitle, hallName);
+        if (isNew || !rawSessionTitle.isEmpty() || customStartTime != null) {
+            String effectiveTitle = buildSessionTitleWithSchedule(
+                    rawSessionTitle.isEmpty() ? "首演黄金场" : rawSessionTitle,
+                    effectiveStart
+            );
+            createdSession = createSessionWithSeats(show, effectiveTitle, hallName, effectiveStart);
         }
 
         try {
@@ -915,20 +935,74 @@ public class ShowCacheAndSeatService {
         return listAllShowsForAdmin(null);
     }
 
-    private ShowSession createSessionWithSeats(ShowInfo show, String sessionTitle, String hallName) {
+    private static final Pattern LEADING_CN_DATE_PATTERN = Pattern.compile(
+            "^\\s*\\d{1,2}月\\d{1,2}日(?:\\s*周[一二三四五六日天])?(?:\\s*\\d{1,2}:\\d{2})?\\s*"
+    );
+
+    public static String chineseWeekday(DayOfWeek dow) {
+        return switch (dow) {
+            case MONDAY -> "周一";
+            case TUESDAY -> "周二";
+            case WEDNESDAY -> "周三";
+            case THURSDAY -> "周四";
+            case FRIDAY -> "周五";
+            case SATURDAY -> "周六";
+            case SUNDAY -> "周日";
+        };
+    }
+
+    public static String formatSessionPrefix(LocalDateTime dt) {
+        return String.format("%d月%d日 %s %02d:%02d",
+                dt.getMonthValue(), dt.getDayOfMonth(), chineseWeekday(dt.getDayOfWeek()),
+                dt.getHour(), dt.getMinute());
+    }
+
+    public static String buildSessionTitleWithSchedule(String rawTitle, LocalDateTime startTime) {
+        String stripped = rawTitle != null ? LEADING_CN_DATE_PATTERN.matcher(rawTitle).replaceFirst("").trim() : "";
+        if (stripped.isEmpty()) {
+            stripped = "首演黄金场";
+        }
+        return formatSessionPrefix(startTime) + " " + stripped;
+    }
+
+    private LocalDateTime parseFlexibleDateTime(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        String clean = raw.trim().replace(' ', 'T');
+        if (clean.length() > 19) {
+            clean = clean.substring(0, 19);
+        }
+        List<DateTimeFormatter> formatters = List.of(
+                DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss"),
+                DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm")
+        );
+        for (DateTimeFormatter fmt : formatters) {
+            try {
+                return LocalDateTime.parse(clean, fmt);
+            } catch (Exception ignored) {
+            }
+        }
+        throw new BizException(400, "开演时间格式无效，请使用日期选择器（如 2026-12-24T19:30）");
+    }
+
+    private ShowSession createSessionWithSeats(ShowInfo show, String sessionTitle, String hallName, LocalDateTime startTime) {
+        LocalDateTime effectiveStart = startTime != null
+                ? startTime
+                : LocalDateTime.now().plusDays(14).withHour(19).withMinute(30).withSecond(0).withNano(0);
         ShowSession session = ShowSession.builder()
                 .showId(show.getId())
                 .sessionCode("SES-" + show.getId() + "-" + (System.currentTimeMillis() % 10000))
                 .sessionTitle(sessionTitle)
                 .hallName(hallName)
-                .startTime(java.time.LocalDateTime.now().plusDays(14).withHour(19).withMinute(30).withSecond(0).withNano(0))
-                .endTime(java.time.LocalDateTime.now().plusDays(14).withHour(22).withMinute(0).withSecond(0).withNano(0))
+                .startTime(effectiveStart)
+                .endTime(effectiveStart.plusHours(2).plusMinutes(30))
                 .totalSeats(48)
                 .availableSeats(48)
                 .lockedSeats(0)
                 .soldSeats(0)
                 .version(0)
-                .createdAt(java.time.LocalDateTime.now())
+                .createdAt(LocalDateTime.now())
                 .build();
         showSessionMapper.insert(session);
 

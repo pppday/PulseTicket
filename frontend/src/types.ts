@@ -444,7 +444,7 @@ export interface AgentInteractiveWidget {
 }
 
 export interface AgentConfirmationCard {
-  actionType: 'CREATE_ORDER' | 'CANCEL_ORDER'
+  actionType: 'CREATE_ORDER' | 'CANCEL_ORDER' | 'REFUND_ORDER'
   toolName: string
   toolCallId: string
   idempotencyKey: string
@@ -461,6 +461,11 @@ export interface AgentConfirmationCard {
     total_amount?: number
     order_no?: string
     refund_reason?: string
+    fee_rate?: string
+    fee_amount?: number
+    refund_amount?: number
+    tier_name?: string
+    hours_before_start?: number
   }
 }
 

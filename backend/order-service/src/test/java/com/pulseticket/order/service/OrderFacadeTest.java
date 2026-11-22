@@ -22,7 +22,9 @@ import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.JdbcTemplate;
 
 import java.math.BigDecimal;
+import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
@@ -202,5 +204,87 @@ class OrderFacadeTest {
         OrderController controller = new OrderController(orderFacade, ticketOrderMapper);
         BizException ex = assertThrows(BizException.class, controller::listMyOrders);
         assertEquals(401, ex.getCode());
+    }
+
+    @Test
+    void refundPaidOrderAppliesFreeTierWhenOver7DaysAndReleasesSeats() {
+        TicketOrder paid = TicketOrder.builder()
+                .id(11L)
+                .orderNo("TK202611220011")
+                .userId(1001L)
+                .sessionId(101L)
+                .seatIdsJson("[20,21]")
+                .totalAmount(new BigDecimal("1360.00"))
+                .startTime(LocalDateTime.now().plusDays(12))
+                .status("PAID")
+                .build();
+        TicketOrder closed = TicketOrder.builder()
+                .id(11L)
+                .orderNo("TK202611220011")
+                .userId(1001L)
+                .sessionId(101L)
+                .seatIdsJson("[20,21]")
+                .totalAmount(new BigDecimal("1360.00"))
+                .startTime(paid.getStartTime())
+                .status("CLOSED")
+                .closeReason("USER_REFUND")
+                .build();
+        when(ticketOrderMapper.selectOne(any())).thenReturn(paid);
+        when(ticketOrderMapper.casRefundPaidOrder("TK202611220011", 1001L, "USER_REFUND")).thenReturn(1);
+        when(ticketOrderMapper.selectById(11L)).thenReturn(closed);
+
+        Map<String, Object> receipt = orderFacade.refundPaidOrder(1001L, "TK202611220011");
+
+        assertEquals("CLOSED", receipt.get("status"));
+        assertEquals("USER_REFUND", receipt.get("closeReason"));
+        assertEquals("0%", receipt.get("feeRate"));
+        assertEquals(new BigDecimal("0.00"), receipt.get("feeAmount"));
+        assertEquals(new BigDecimal("1360.00"), receipt.get("refundAmount"));
+        verify(showSeatClient).releaseSeats(any());
+        verify(seataAuditService).recordMqEvent(anyString(), anyString(), anyString(), eq("TK202611220011"), eq("ORDER_REFUNDED"), anyString(), eq("DELIVERED"));
+    }
+
+    @Test
+    void refundPaidOrderApplies10PercentFeeAndRejectsUnder24Hours() {
+        TicketOrder paidMid = TicketOrder.builder()
+                .id(12L)
+                .orderNo("TK202611220012")
+                .userId(1001L)
+                .sessionId(201L)
+                .seatIdsJson("[12]")
+                .totalAmount(new BigDecimal("1080.00"))
+                .startTime(LocalDateTime.now().plusDays(5))
+                .status("PAID")
+                .build();
+        TicketOrder closedMid = TicketOrder.builder()
+                .id(12L)
+                .orderNo("TK202611220012")
+                .userId(1001L)
+                .totalAmount(new BigDecimal("1080.00"))
+                .startTime(paidMid.getStartTime())
+                .status("CLOSED")
+                .closeReason("USER_REFUND")
+                .build();
+        when(ticketOrderMapper.selectOne(any())).thenReturn(paidMid);
+        when(ticketOrderMapper.casRefundPaidOrder("TK202611220012", 1001L, "USER_REFUND")).thenReturn(1);
+        when(ticketOrderMapper.selectById(12L)).thenReturn(closedMid);
+
+        Map<String, Object> receipt = orderFacade.refundPaidOrder(1001L, "TK202611220012");
+        assertEquals("10%", receipt.get("feeRate"));
+        assertEquals(new BigDecimal("108.00"), receipt.get("feeAmount"));
+        assertEquals(new BigDecimal("972.00"), receipt.get("refundAmount"));
+
+        TicketOrder paidLate = TicketOrder.builder()
+                .id(13L)
+                .orderNo("TK202611220013")
+                .userId(1001L)
+                .totalAmount(new BigDecimal("500.00"))
+                .startTime(LocalDateTime.now().plusHours(12))
+                .status("PAID")
+                .build();
+        when(ticketOrderMapper.selectOne(any())).thenReturn(paidLate);
+        BizException ex = assertThrows(BizException.class,
+                () -> orderFacade.refundPaidOrder(1001L, "TK202611220013"));
+        assertEquals(409, ex.getCode());
     }
 }

@@ -396,10 +396,10 @@ def calculate_tiered_refund_quote(
 
 async def inspect_order_for_cancel(order_no: str) -> Dict[str, Any]:
     """
-    进入取消确认卡片前向 Java order-service 校验订单归属与当前真实状态：
-    - 仅允许 UNPAID 订单进入取消确认卡片
-    - PAID 订单自动运行确定性阶梯退票算费，给出精确手续费与预计退款说明
-    - CLOSED 订单直接告知无需重复取消
+    进入取消/退票确认卡片前向 Java order-service 校验订单归属与当前真实状态：
+    - UNPAID 订单：允许进入 CANCEL_ORDER 取消确认卡片
+    - PAID 订单：运行确定性阶梯退票算费，>= 24h 允许进入 REFUND_ORDER 确认卡片；< 24h 拦截并附明细说明
+    - CLOSED 订单：直接告知无需重复操作
     """
     clean_no = (order_no or "").strip()
     if not clean_no:
@@ -421,45 +421,60 @@ async def inspect_order_for_cancel(order_no: str) -> Dict[str, Any]:
                 }
             order = body["data"]
             status = order.get("status")
+            try:
+                seat_labels = json.loads(order.get("seatLabelsJson") or "[]")
+            except Exception:
+                seat_labels = []
+
             if status == "PAID":
                 calc = calculate_tiered_refund_quote(order.get("totalAmount"), order.get("startTime"))
+                if calc.get("knownStartTime") and calc.get("refundable"):
+                    return {
+                        "ok": True,
+                        "isMock": False,
+                        "actionType": "REFUND_ORDER",
+                        "toolName": "propose_refund_order",
+                        "orderStatus": "PAID",
+                        "refundCalc": calc,
+                        "order": {
+                            "orderNo": order.get("orderNo", clean_no),
+                            "showTitle": order.get("showTitle", ""),
+                            "sessionTitle": order.get("sessionTitle", ""),
+                            "seatLabels": seat_labels,
+                            "totalAmount": order.get("totalAmount"),
+                            "startTime": order.get("startTime"),
+                            "ticketCode": order.get("ticketCode"),
+                            "status": status,
+                        },
+                    }
+
                 calc_desc = ""
                 if calc.get("knownStartTime"):
-                    if calc["refundable"]:
-                        calc_desc = (
-                            f"经系统按 [{calc['policyCode']}] 确定性核算：当前距开演 {calc['hoursBeforeStart']} 小时，"
-                            f"命中「{calc['tierName']}」，手续费 ¥{calc['feeAmount']}（{calc['feeRate']}），"
-                            f"预计可退金额 ¥{calc['refundAmount']}。"
-                        )
-                    else:
-                        calc_desc = (
-                            f"经系统按 [{calc['policyCode']}] 确定性核算：当前距开演 {calc['hoursBeforeStart']} 小时，"
-                            f"处于「{calc['tierName']}」，不支持常规退票。"
-                        )
+                    calc_desc = (
+                        f"经系统按 [{calc['policyCode']}] 确定性核算：当前距开演 {calc['hoursBeforeStart']} 小时，"
+                        f"处于「{calc['tierName']}」，暂不支持自助退票。"
+                    )
+                else:
+                    calc_desc = str(calc.get("summary") or "场次开演时间未知，暂不支持自助退票。")
                 return {
                     "ok": False,
                     "retryable": False,
                     "orderStatus": "PAID",
                     "refundCalc": calc,
-                    "message": (
-                        f"订单 {clean_no} 已完成支付出票（核验码 {order.get('ticketCode') or '已签发'}），"
-                        f"线上自助取消仅适用于未支付（UNPAID）锁座单。{calc_desc}如需办理已出票退订请联系人工客服。"
-                    ),
+                    "message": f"订单 {clean_no} 已出票（核验码 {order.get('ticketCode') or '已签发'}）。{calc_desc}",
                 }
             if status != "UNPAID":
                 return {
                     "ok": False,
                     "retryable": False,
-                    "message": f"订单 {clean_no} 当前状态为 {status}（{order.get('closeReason') or '已关闭'}），无需重复取消。",
+                    "message": f"订单 {clean_no} 当前状态为 {status}（{order.get('closeReason') or '已关闭'}），无需重复操作。",
                 }
 
-            try:
-                seat_labels = json.loads(order.get("seatLabelsJson") or "[]")
-            except Exception:
-                seat_labels = []
             return {
                 "ok": True,
                 "isMock": False,
+                "actionType": "CANCEL_ORDER",
+                "toolName": "propose_cancel_order",
                 "order": {
                     "orderNo": order.get("orderNo", clean_no),
                     "showTitle": order.get("showTitle", ""),
@@ -475,10 +490,12 @@ async def inspect_order_for_cancel(order_no: str) -> Dict[str, Any]:
             return {
                 "ok": True,
                 "isMock": True,
+                "actionType": "CANCEL_ORDER",
+                "toolName": "propose_cancel_order",
                 "order": {
                     "orderNo": clean_no,
                     "showTitle": "「星际回响 · PulseLive」2026 全息交响电音巡演",
-                    "sessionTitle": "11月15日 周六 19:30 首演黄金场",
+                    "sessionTitle": "首演黄金场",
                     "seatLabels": ["中轴声场优选区 3排04座", "中轴声场优选区 3排05座"],
                     "totalAmount": 1360.0,
                     "status": "UNPAID",
@@ -820,7 +837,20 @@ async def propose_cancel_order(
     """
     【高风险写操作工具 — 取消未支付订单】
     当用户明确要求取消某笔未支付（UNPAID）订单时调用此工具。
-    系统会先向 Java 校验订单状态，仅未支付订单会触发 LangGraph interrupt() 确认卡片。
+    系统会先向 Java 校验订单状态，仅未支付订单会触发取消确认卡片。
+    """
+    return "PENDING_HUMAN_CONFIRMATION"
+
+
+@tool
+async def propose_refund_order(
+    order_no: str,
+    refund_reason: str = "用户主动申请已支付订单阶梯退票",
+) -> str:
+    """
+    【高风险写操作工具 — 已支付订单自助阶梯退票】
+    当用户明确要求退票/退款某笔已支付（PAID）且距离开演 >= 24 小时的订单时调用此工具。
+    系统会先向 Java 校验订单归属并按 [POL-REFUND-001] 核算准确手续费与实退金额，随后弹出确认卡片。
     """
     return "PENDING_HUMAN_CONFIRMATION"
 
@@ -939,6 +969,61 @@ async def execute_confirmed_write_action(
                 "message": f"调用 Java 订单服务取消接口超时或不可达（{type(exc).__name__}），请先查询订单状态确认。",
             }
 
+    if action_name == "propose_refund_order":
+        order_no = str(args["order_no"]).strip()
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                resp = await client.post(
+                    f"{settings.ORDER_SERVICE_URL}/api/order/{order_no}/refund",
+                    headers=headers,
+                )
+                body = resp.json()
+                receipt = body.get("data") or {}
+                if resp.status_code == 200 and body.get("code") == 200 and receipt.get("status") == "CLOSED":
+                    return {
+                        "success": True,
+                        "isMock": False,
+                        "source": "Java order-service(:8203) [CAS + Seat Release]",
+                        "orderNo": receipt.get("orderNo", order_no),
+                        "status": receipt.get("status"),
+                        "closeReason": receipt.get("closeReason", "USER_REFUND"),
+                        "policyCode": receipt.get("policyCode", "POL-REFUND-001"),
+                        "tierName": receipt.get("tierName"),
+                        "feeRate": receipt.get("feeRate"),
+                        "totalAmount": receipt.get("totalAmount"),
+                        "feeAmount": receipt.get("feeAmount"),
+                        "refundAmount": receipt.get("refundAmount"),
+                        "hoursBeforeStart": receipt.get("hoursBeforeStart"),
+                        "message": body.get("message", "退票申请已办结，座位已释放"),
+                    }
+                return {
+                    "success": False,
+                    "retryable": resp.status_code >= 500,
+                    "message": body.get("message", f"退票申请失败 (HTTP {resp.status_code})"),
+                }
+        except Exception as exc:
+            if settings.DEV_MOCK:
+                return {
+                    "success": True,
+                    "isMock": True,
+                    "source": "本地 DEV_MOCK 模拟退票（未连接 Java order-service:8203）",
+                    "orderNo": order_no,
+                    "status": "CLOSED",
+                    "closeReason": "USER_REFUND",
+                    "policyCode": "POL-REFUND-001",
+                    "tierName": args.get("tier_name", "标准退票期"),
+                    "feeRate": args.get("fee_rate", "0%"),
+                    "totalAmount": args.get("total_amount"),
+                    "feeAmount": args.get("fee_amount", 0.0),
+                    "refundAmount": args.get("refund_amount", args.get("total_amount")),
+                    "message": f"【DEV_MOCK 离线模拟】订单 {order_no} 已模拟退票。",
+                }
+            return {
+                "success": False,
+                "retryable": True,
+                "message": f"调用 Java 订单服务退票接口超时或不可达（{type(exc).__name__}），请先查询订单状态确认。",
+            }
+
     return {"success": False, "retryable": False, "message": f"未知写操作工具: {action_name}"}
 
 
@@ -947,7 +1032,7 @@ KNOWLEDGE_TOOLS = [search_ticket_policy]
 PURCHASE_READ_TOOLS = [search_shows, recommend_seats]
 PURCHASE_WRITE_TOOLS = [propose_create_order]
 ORDER_READ_TOOLS = [list_my_orders, check_order_refund_detail]
-ORDER_WRITE_TOOLS = [propose_cancel_order]
+ORDER_WRITE_TOOLS = [propose_cancel_order, propose_refund_order]
 
 # 区分只读工具与高风险写操作工具（读写分离路由）
 READ_TOOLS = [
@@ -961,6 +1046,7 @@ READ_TOOLS = [
 WRITE_TOOLS = [
     propose_create_order,
     propose_cancel_order,
+    propose_refund_order,
 ]
 
 ALL_TOOLS = READ_TOOLS + WRITE_TOOLS

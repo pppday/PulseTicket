@@ -45,4 +45,23 @@ public interface TicketOrderMapper extends BaseMapper<TicketOrder> {
             @Param("orderNo") String orderNo,
             @Param("closeReason") String closeReason
     );
+
+    /**
+     * 订单状态机 CAS 原子退票：仅当 status = 'PAID' 时允许用户自助退票关单
+     */
+    @Update("""
+            UPDATE ticket_order
+            SET status = 'CLOSED',
+                close_reason = #{closeReason},
+                closed_at = NOW(3),
+                version = version + 1
+            WHERE order_no = #{orderNo}
+              AND user_id = #{userId}
+              AND status = 'PAID'
+            """)
+    int casRefundPaidOrder(
+            @Param("orderNo") String orderNo,
+            @Param("userId") Long userId,
+            @Param("closeReason") String closeReason
+    );
 }

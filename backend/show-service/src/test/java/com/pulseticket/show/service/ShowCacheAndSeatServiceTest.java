@@ -49,8 +49,8 @@ class ShowCacheAndSeatServiceTest {
         ShowSession session = ShowSession.builder()
                 .id(101L)
                 .showId(1L)
-                .sessionTitle("11月15日 周六 19:30 首演黄金场")
-                .startTime(LocalDateTime.of(2026, 11, 15, 19, 30))
+                .sessionTitle("首演黄金场")
+                .startTime(LocalDateTime.now().plusDays(12).withHour(19).withMinute(30))
                 .build();
         ShowInfo show = ShowInfo.builder()
                 .id(1L)
@@ -101,6 +101,23 @@ class ShowCacheAndSeatServiceTest {
     void quoteSessionSeatsRejectsOffShelfShow() {
         ShowSession session = ShowSession.builder().id(101L).showId(1L).build();
         ShowInfo show = ShowInfo.builder().id(1L).status("OFF_SHELF").build();
+
+        when(showSessionMapper.selectById(101L)).thenReturn(session);
+        when(showInfoMapper.selectById(1L)).thenReturn(show);
+
+        BizException ex = assertThrows(BizException.class,
+                () -> showService.quoteSessionSeats(101L, List.of(1L)));
+        assertEquals(409, ex.getCode());
+    }
+
+    @Test
+    void quoteSessionSeatsRejectsExpiredSession() {
+        ShowSession session = ShowSession.builder()
+                .id(101L)
+                .showId(1L)
+                .startTime(LocalDateTime.now().minusDays(2))
+                .build();
+        ShowInfo show = ShowInfo.builder().id(1L).status("ON_SALE").build();
 
         when(showSessionMapper.selectById(101L)).thenReturn(session);
         when(showInfoMapper.selectById(1L)).thenReturn(show);

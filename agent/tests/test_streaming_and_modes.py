@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,7 @@ from app.graph.guard_and_router import extract_deterministic_signals  # noqa: E4
 from app.graph import main_graph as mg_mod  # noqa: E402
 from app.graph.main_graph import MultiAgentTicketManager  # noqa: E402
 from app.graph.subgraphs import knowledge as kg_mod  # noqa: E402
+from app.graph.subgraphs import order as ord_mod  # noqa: E402
 from app.graph.subgraphs import purchase as pur_mod  # noqa: E402
 from app.observability.tracer import AgentTracer  # noqa: E402
 from app.rag.hybrid_rag import hybrid_rag_engine  # noqa: E402
@@ -244,6 +246,98 @@ class TestStreamingAndModes(unittest.IsolatedAsyncioTestCase):
             any("我叫ppday" in c for c in turn2_contents),
             f"Turn 2 chitchat prompt missing Turn 1 history: {turn2_contents}",
         )
+
+    async def test_6_how_to_refund_hits_pol_refund_001_without_refusal(self):
+        router_llm = FakeStaticLLM('{"intents": ["policy", "order"], "slots": {}}')
+        kg_llm = FakeStreamingLLM([["距离开演大于等于 7 天免费退票 [POL-REFUND-001]。"]])
+        ord_llm = FakeStreamingLLM([["如需对具体订单办理退票，可先查询订单列表后一键发起。"]])
+
+        with patch.object(gr_mod, "get_chat_llm", return_value=router_llm), \
+             patch.object(kg_mod, "get_chat_llm", return_value=kg_llm), \
+             patch.object(ord_mod, "_get_order_llm", return_value=ord_llm):
+            res = await self.manager.chat(
+                thread_id="th-how-refund",
+                user_message="怎么退款",
+                user_id=1001,
+                username="zhaolan",
+                mode="agent",
+            )
+
+        self.assertEqual(res["status"], "COMPLETED")
+        self.assertNotIn("暂未收录", res["reply"])
+        self.assertIn("POL-REFUND-001", res["citations"])
+
+    async def test_7_paid_order_refund_interrupt_and_execute_flow(self):
+        future_start = (datetime.now() + timedelta(days=5)).strftime("%Y-%m-%d %H:%M:%S")
+        detail_resp = FakeHttpResp(200, {
+            "code": 200,
+            "data": {
+                "orderNo": "TK202611220099",
+                "showTitle": "「歌剧魅影」驻场版",
+                "sessionTitle": "首演礼宾场",
+                "seatLabelsJson": '["1排01座"]',
+                "totalAmount": 1000.0,
+                "startTime": future_start,
+                "ticketCode": "PT-8899-0099",
+                "status": "PAID",
+            },
+        })
+        refund_resp = FakeHttpResp(200, {
+            "code": 200,
+            "message": "退票申请已办结，座位已释放",
+            "data": {
+                "orderNo": "TK202611220099",
+                "status": "CLOSED",
+                "closeReason": "USER_REFUND",
+                "policyCode": "POL-REFUND-001",
+                "tierName": "标准退票期（距开演 48h ~ 168h，收取 10% 手续费）",
+                "feeRate": "10%",
+                "totalAmount": 1000.0,
+                "feeAmount": 100.0,
+                "refundAmount": 900.0,
+            },
+        })
+
+        router_llm = FakeStaticLLM('{"intents": ["order"], "slots": {"order_no": "TK202611220099"}}')
+        ord_llm = FakeStreamingLLM([
+            AIMessage(
+                content="",
+                tool_calls=[{
+                    "id": "tc_ref_1",
+                    "name": "propose_refund_order",
+                    "args": {"order_no": "TK202611220099"},
+                    "type": "tool_call",
+                }],
+            )
+        ])
+
+        with patch.object(gr_mod, "get_chat_llm", return_value=router_llm), \
+             patch.object(ord_mod, "_get_order_llm", return_value=ord_llm), \
+             patch.object(tools_mod.httpx.AsyncClient, "get", new=AsyncMock(return_value=detail_resp)), \
+             patch.object(tools_mod.httpx.AsyncClient, "post", new=AsyncMock(return_value=refund_resp)):
+            r1 = await self.manager.chat(
+                thread_id="th-refund-flow",
+                user_message="我要给订单 TK202611220099 申请退票",
+                user_id=1001,
+                username="zhaolan",
+                mode="agent",
+            )
+            self.assertEqual(r1["status"], "INTERRUPTED")
+            card = r1["confirmationCard"]
+            self.assertEqual(card["actionType"], "REFUND_ORDER")
+            self.assertEqual(card["args"]["fee_rate"], "10%")
+            self.assertEqual(card["args"]["fee_amount"], 100.0)
+            self.assertEqual(card["args"]["refund_amount"], 900.0)
+
+            r2 = await self.manager.confirm(
+                thread_id="th-refund-flow",
+                confirmed=True,
+                user_id=1001,
+                username="zhaolan",
+            )
+            self.assertEqual(r2["status"], "COMPLETED")
+            self.assertIn("900.0", r2["reply"])
+            self.assertIn("USER_REFUND", r2["reply"])
 
 
 if __name__ == "__main__":
