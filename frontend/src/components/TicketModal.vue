@@ -1,4 +1,8 @@
 <script setup lang="ts">
+/**
+ * 【电子票凭证与扫码核验二维码弹窗（TicketModal）】
+ * 为已支付订单实时渲染可扫码的电子票核验链接二维码，手机扫码即可免登录打开 VerifyTicketView 核验真伪。
+ */
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import QRCode from 'qrcode'
 import { ExternalLink, X } from 'lucide-vue-next'

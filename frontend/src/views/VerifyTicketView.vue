@@ -1,4 +1,8 @@
 <script setup lang="ts">
+/**
+ * 【公开电子票扫码核验 H5 页（VerifyTicketView）】
+ * 手机微信或相机扫描电子票二维码后免登录打开，调用 `/api/order/public/verify/{ticketCode}` 实时核验票面状态与座位归属。
+ */
 import { computed, onMounted, ref } from 'vue'
 import { AlertCircle, ArrowLeft, CheckCircle2, Ticket } from 'lucide-vue-next'
 import { api } from '../api'

@@ -1,3 +1,16 @@
+"""
+【黑盒子图 ②：purchase_agent —— 选座与购票专员】
+
+通俗理解：这是剧场的“卖票导购员”，负责帮你找演出、挑同排中轴线连座，但**没有直接扣款锁座的权限**。
+
+内部执行闭环：
+  START
+    -> purchase_agent（推理决策节点：Chat 模式只绑只读工具；Agent 模式才额外允许提出 `propose_create_order` 草案）
+    -> 分支 A：purchase_read_tools（调 Java show-service 查演出和推荐座位，同步更新 SharedSlots，并向前端推送可点击的演出/选座交互卡片，最多循环 4 步）
+    -> 分支 B：server_quote（确定性服务端核价门控：不相信大模型自己算的价钱，强行调 Java show-service 实时验座 AVAILABLE 并用 BigDecimal 权威算总价；验座失败就把报错回传给大模型重新选，验座通过就组装 `pending_action` 交回主图弹人工确认卡）
+  -> END
+"""
+
 import json
 from typing import Annotated, Any, Dict, List, Optional, TypedDict
 

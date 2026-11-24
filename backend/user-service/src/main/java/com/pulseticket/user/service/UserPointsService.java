@@ -18,6 +18,10 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 
+/**
+ * 会员观演积分与站内信异步补偿服务。
+ * 通过 `points_log` 联合唯一索引 `(order_no, biz_type)` 兜底，保证 RabbitMQ 消息重投时既不会多发积分，也不会重复扣分。
+ */
 @Service
 @RequiredArgsConstructor
 public class UserPointsService {

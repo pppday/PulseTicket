@@ -6,6 +6,10 @@ import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
 import org.apache.ibatis.annotations.Update;
 
+/**
+ * 会员账号表（user_account）Mapper。
+ * 提供数据库层原子增减积分与成单数的 SQL（退票冲正使用 GREATEST(0, ...) 保证积分永不扣成负数）。
+ */
 @Mapper
 public interface UserAccountMapper extends BaseMapper<UserAccount> {
 

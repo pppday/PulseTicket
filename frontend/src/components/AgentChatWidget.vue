@@ -1,4 +1,13 @@
 <script setup lang="ts">
+/**
+ * 【PulseTicket 右下角悬浮智能客服与购票助手（AgentChatWidget）】
+ *
+ * 通俗理解：这是直接对接 Python LangGraph 多智能体的前端交互核心，完整实现了：
+ * 1. 双模式切换：Agent 任务模式（可触发选座锁单/退改确认） vs Chat 只读咨询模式；
+ * 2. 实时 SSE 流式渲染：逐字打字机输出、折叠“思考过程链”、工具调用胶囊与交互式选演/选座/选单卡片；
+ * 3. LangGraph interrupt() 人工确认门控闭环：收到高风险写提案后弹出确定性核价确认卡，用户点击【确认】或【暂不执行】后调用 `/api/agent/confirm/stream` 唤醒挂起图；
+ * 4. 历史会话抽屉管理：按用户隔离保存和恢复多轮 threadId。
+ */
 import { computed, nextTick, ref, watch } from 'vue'
 import {
   AlertCircle,

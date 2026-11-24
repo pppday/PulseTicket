@@ -10,6 +10,10 @@ import lombok.NoArgsConstructor;
 
 import java.time.LocalDateTime;
 
+/**
+ * 会员积分变动流水实体（映射 `ticket_user.points_log` 表）。
+ * 表上建有联合唯一索引 `(order_no, biz_type)`，既是积分账本，也是 RabbitMQ 消费防重幂等锁。
+ */
 @Data
 @Builder
 @NoArgsConstructor

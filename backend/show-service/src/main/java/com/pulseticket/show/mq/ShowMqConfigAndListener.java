@@ -16,6 +16,12 @@ import org.springframework.context.annotation.Configuration;
 
 import java.io.IOException;
 
+/**
+ * show-service 的 RabbitMQ 消费者与队列声明配置：
+ * 1. 监听支付成功广播队列（`ticket.show.paid.queue`）：收到后幂等把座位状态从 `LOCKED` 正式改为 `SOLD`；
+ * 2. 监听关单/退票释座队列（`ticket.show.closed.release.queue`）：收到后幂等把座位归还为 `AVAILABLE`，并同步清理 Redis 座位图缓存。
+ * 所有监听器均采用手动 ACK，确保消息处理成功后再确认消费。
+ */
 @Configuration
 @RequiredArgsConstructor
 public class ShowMqConfigAndListener {

@@ -1,3 +1,24 @@
+"""
+【PulseTicket 多智能体主控图（Main Graph）—— 线上 v2 核心编排引擎】
+
+通俗理解：你可以把本文件想象成「智能客服大厅的总调度中心」。
+它自己不直接查库、也不直接调业务接口，而是负责把用户的一句话拆成清晰步骤，依次派给三个互相隔离的专员子图，并在涉及“锁座下单/取消/退票”等动钱动库存的高风险动作时，强行踩下刹车弹窗让真人确认：
+
+完整流转链路：
+  START
+    -> input_guard（安检门：验登录身份、防 Prompt 注入改价、裁剪近 3 轮对话）
+    -> intent_router（分诊台：正则扣订单号/预算/排座 + DeepSeek 排定 policy -> order -> purchase 顺序）
+    -> _route_next_intent 循环调度器（按顺序叫号：knowledge_agent / order_agent / purchase_agent / chitchat_node）
+    -> [若任意子图产出 pending_action] confirm_action（调用 LangGraph interrupt() 暂停并把快照存入 PostgreSQL，等用户点确认后带幂等键调真实 Java 写接口）
+    -> response_composer（汇总台：单意图直出结论，多意图按标题分节拼接）
+  -> END
+
+核心面试亮点：
+1. 星型隔离架构：3 个子图互不直接连边，仅通过主图 `MainGraphState.slots` 传递结构化上下文；
+2. 写操作人工确认门控：利用 PostgreSQL Checkpointer + `interrupt()`/`Command(resume=...)` 实现跨请求甚至跨重启的断点恢复；
+3. 端到端防重幂等：写操作携带 `idempotencyKey = "{thread_id}:{tool_call_id}"` 透传给 Java 下单/退票接口。
+"""
+
 import asyncio
 from datetime import datetime
 import json

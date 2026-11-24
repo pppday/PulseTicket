@@ -11,6 +11,11 @@ import lombok.NoArgsConstructor;
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 
+/**
+ * 座位库存实体（映射 `ticket_show.seat_inventory` 表）。
+ * 每场演出默认生成 48 座矩阵（6排×8座），核心字段 `status` 流转路径为 AVAILABLE -> LOCKED -> SOLD，
+ * 配合 `version` 乐观锁与条件 SQL 实现高并发下零超卖。
+ */
 @Data
 @Builder
 @NoArgsConstructor

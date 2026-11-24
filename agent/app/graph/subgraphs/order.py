@@ -1,3 +1,16 @@
+"""
+【黑盒子图 ③：order_agent —— 订单与售后专员】
+
+通俗理解：这是剧场的“订单售后窗口”，负责查你名下买过哪些票、用代码精确计算阶梯退票手续费，并在你明确要取消/退票时先做资格审核。
+
+内部执行闭环：
+  START
+    -> order_agent（推理决策节点：Chat 模式只查单与算费；Agent 模式才允许提交 `propose_cancel_order` / `propose_refund_order` 草案）
+    -> 分支 A：order_read_tools（调 Java order-service 查本人订单，用 Python Decimal 精算阶梯退费防止大模型心算出错，并向前端推送可点击的订单选择卡片）
+    -> 分支 B：verify_cancel（确定性售后前置校验节点：实时查 Java order-service 核验订单归属本人、当前状态、距开演是否 >= 24 小时；不满足则驳回并交大模型解释原因，满足则组装 `pending_action` 交回主图弹确认卡）
+  -> END
+"""
+
 import json
 from typing import Annotated, Any, Dict, List, Optional, TypedDict
 

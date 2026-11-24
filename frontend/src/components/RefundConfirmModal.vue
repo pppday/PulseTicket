@@ -1,4 +1,8 @@
 <script setup lang="ts">
+/**
+ * 【自助阶梯退票二次确认弹窗（RefundConfirmModal）】
+ * 按 [POL-REFUND-001] 规则可视化高亮当前所处退票阶梯（0% / 10% / 20% 手续费），展示原付/手续费/实退金额及积分同步扣回提示。
+ */
 import { computed, onMounted, onUnmounted, watch } from 'vue'
 import { AlertCircle, Check, Clock, Loader2, RotateCcw, Ticket, X } from 'lucide-vue-next'
 import { state } from '../store'

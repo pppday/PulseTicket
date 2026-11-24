@@ -1,4 +1,9 @@
 <script setup lang="ts">
+/**
+ * 【选座右侧结算确认栏（CheckoutPanel）】
+ * 汇总已选座位明细、单价与总金额，点击提交后调用 order-service 三层防线锁座创单；
+ * 管理员登录时额外提供“15 秒极速死信关单演示”与“Seata AT 故障回滚演练”两个调试开关。
+ */
 import { computed } from 'vue'
 import { Smartphone, X } from 'lucide-vue-next'
 import ToggleRow from './ToggleRow.vue'

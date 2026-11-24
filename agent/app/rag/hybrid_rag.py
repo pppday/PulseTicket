@@ -1,3 +1,16 @@
+"""
+【票务知识库双路混合检索引擎（Hybrid RAG）】
+
+通俗理解：这是智能体的“政策档案馆管理员”，负责把 `knowledge/*.md` 里的退票条款、实名制、场馆路线切块建索引，并用双路召回 + 重排把最准的条款翻出来。
+
+完整检索链路（面试高频考点）：
+1. 语义分片：按 Markdown 二级标题（`##`）拆块，超长章节再用 500 字滑动窗口 + 50 字重叠切分，避免把一条规则截成两半；
+2. 稀疏检索（Sparse）：`jieba` 中文分词 + 领域同义词桥接 + `BM25Okapi`，擅长精确命中数字（如 1.2 米、48 小时）、站名和条款编号；
+3. 稠密检索（Dense）：远程 Embedding 模型（`BAAI/bge-m3`）生成向量存入 PostgreSQL `pgvector`（HNSW 余弦索引），理解口语化语义；
+4. 融合与精排：先做 RRF（倒数秩融合）合并双路候选，再调用 Cross-Encoder（`BAAI/bge-reranker-v2-m3`）做细粒度打分重排；
+5. 优雅降级：本地没配 Embedding Key 或无 PG 时不造假向量，诚实降级为内存矩阵或 BM25-only 并标记 `degraded=True`。
+"""
+
 import atexit
 from collections import OrderedDict
 import hashlib

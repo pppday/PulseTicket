@@ -1,4 +1,8 @@
 <script setup lang="ts">
+/**
+ * 【登录与注册页（AuthView）】
+ * 负责普通观众/管理员登录以及新用户注册（强制校验 11 位中国大陆手机号），成功后通过 store 持久化 JWT 并进入大厅。
+ */
 import { ref } from 'vue'
 import { Eye, EyeOff, ShieldCheck, Smartphone, Ticket, UserCheck } from 'lucide-vue-next'
 import { login, register } from '../store'

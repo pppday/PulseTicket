@@ -6,6 +6,11 @@ import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
 import org.apache.ibatis.annotations.Update;
 
+/**
+ * `ticket_order` 表的 MyBatis-Plus 数据访问接口
+ * 核心亮点：所有涉及资金和状态的流转（支付、超时关单、阶梯退票）全部采用数据库级 CAS 条件更新，
+ * 通过 `WHERE status = 期望前置状态` 彻底杜绝并发竞态下的重复支付、重复退票或“刚付款就被关单”事故！
+ */
 @Mapper
 public interface TicketOrderMapper extends BaseMapper<TicketOrder> {
 

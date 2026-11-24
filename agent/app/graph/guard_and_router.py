@@ -1,3 +1,16 @@
+"""
+主图前置安检与意图路由模块（v2 多智能体主图的第 1 站与第 2 站）。
+
+核心职责：
+1. `input_guard_node`（安全护栏）：
+   - 核验网关透传的用户身份是否合法；
+   - 拦截超长输入、越狱/套取 System Prompt、0 元改价、绕过人工确认卡片、伪造管理员权限等高危攻击。
+2. `intent_router_node`（结构化意图路由器）：
+   - 采用「确定性正则先验抽取 + 温度 0.0 大模型 JSON 路由 + 强信号校准兜底」双保险机制；
+   - 把一句复合口语（例如“上海那场能退票吗？能的话推荐两张 700 以内靠边座位”）拆成有序意图队列
+     `["policy", "purchase"]`，并合并跨轮共享槽位 `SharedSlots` 交给主图按序派单。
+"""
+
 import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -36,6 +49,7 @@ _INJECTION_PATTERNS: List[Tuple[re.Pattern, str]] = [
     ),
 ]
 
+# 中文数字转阿拉伯数字映射（限购最多 6 张、每排最多 8 座）
 _CN_NUM_MAP = {"一": 1, "两": 2, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6}
 _CN_SEAT_MAP = {"一": 1, "两": 2, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8}
 
@@ -47,6 +61,7 @@ def _parse_cn_or_digit(token: str) -> int:
         return _CN_SEAT_MAP[t]
     return int(t)
 
+# 各业务域确定性关键词表：用于快速识别强意图信号，并与 LLM 路由结果相互兜底校验
 _POLICY_KW = (
     "退票", "退款", "退单", "退订", "退钱", "全额退", "手续费", "改签", "实名", "身份证", "儿童", "小孩", "身高", "检票", "核验",
     "地铁", "怎么走", "路线", "交通", "停车", "雨伞", "长柄伞", "禁带", "带水", "饮料",
@@ -62,9 +77,11 @@ _POLICY_ASK_KW = (
     "寄存", "存包", "多久支付", "超时", "自动取消", "发票", "报销", "顺丰", "快递", "纸质票",
     "邮寄", "宠物", "猫", "狗", "会员升级", "学生票", "半价", "优惠",
 )
+# 直接对订单执行动作的短语（配合订单号使用，避免拉起规则知识子图长篇大论）
 _DIRECT_ORDER_ACTION_KW = (
     "申请退票", "申请退款", "退票退款", "取消订单", "申请取消", "退掉这单", "退订订单",
 )
+# 演出查询与智能选座相关关键词
 _PURCHASE_KW = (
     "推荐", "选座", "连座", "座位", "有什么演出", "有哪些演出", "近期演出", "想看",
     "星际回响", "歌剧魅影", "音乐剧", "星际穿越", "西湖", "爵士", "白雪公主",
@@ -73,6 +90,7 @@ _PURCHASE_KW = (
     "换个座位", "换座位", "其他价位", "别的价位", "看台",
     "观看体验", "观演体验", "最佳", "靠边", "过道",
 )
+# 价格偏好（低价/相对更便宜/高价 VIP）与横向位置偏好（靠边过道/中轴居中）关键词
 _CHEAPER_KW = (
     "便宜一点", "便宜点", "更便宜", "便宜些", "便宜的", "最便宜",
     "太贵", "贵了", "低价", "性价比", "经济", "省钱", "看台", "便宜",
@@ -86,12 +104,14 @@ _HIGHER_KW = (
 )
 _SIDE_KW = ("靠边", "靠过道", "过道", "边上", "边缘", "最边")
 _CENTER_KW = ("中间", "中轴", "正中", "正中间", "居中")
+# 订单查询与售后退改关键词
 _ORDER_KW = (
     "我的订单", "历史订单", "查订单", "订单状态", "取消订单", "退掉这单", "退订订单",
     "取消刚才", "刚才那单", "不付了", "申请退票", "申请退款", "退票退款",
     "帮我退票", "帮我退款", "我要退票", "我要退款",
     "怎么退款", "如何退款", "怎么退票", "如何退票", "退票流程", "退款流程",
 )
+# 明确要求“立即锁座下单”的强提交意图词（用于把“只是看看推荐”与“现在就买”区分开）
 _COMMIT_KW = (
     "锁座", "锁定", "下单", "就买这", "就订这", "就选这", "帮我买这", "帮我锁", "确认买", "立即购买",
 )
@@ -131,6 +151,7 @@ ROUTER_SYSTEM_PROMPT = """你是 PulseTicket 票务主控图的【意图路由�
 
 
 def detect_prompt_injection(text: str) -> Optional[str]:
+    """检测用户输入是否超长或命中提示词注入/改价/提权正则，命中返回拦截原因，正常返回 None。"""
     clean = (text or "").strip()
     if len(clean) > 2000:
         return "单次输入长度超出安全上限（2000 字符）"
@@ -360,6 +381,7 @@ def _normalize_intents(raw_intents: List[str]) -> List[str]:
 
 
 def _extract_json_obj(text: str) -> Optional[Dict[str, Any]]:
+    """容错解析大模型输出的 JSON 字符串：自动剥离 ```json 代码块包裹与前后废话，失败返回 None。"""
     raw = (text or "").strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
@@ -375,6 +397,7 @@ def _extract_json_obj(text: str) -> Optional[Dict[str, Any]]:
 
 async def input_guard_node(state: MainGraphState) -> Dict[str, Any]:
     """【主图第 1 站：安全护栏 input_guard】校验身份、长度限制与提示词注入/改价攻击。"""
+    # 第一道门禁：确认上游网关已透传合法用户身份
     uid = state.get("user_id")
     uname = (state.get("username") or "").strip()
     if not isinstance(uid, int) or uid <= 0 or not uname:
@@ -385,8 +408,10 @@ async def input_guard_node(state: MainGraphState) -> Dict[str, Any]:
     if not latest_query and msgs:
         latest_query = str(msgs[-1].content or "")
 
+    # 裁剪出最近 3 轮历史对话摘要，供后续路由与子图理解指代，避免把几十轮旧聊天全塞进 Prompt
     summary, _ = summarize_and_trim_history(msgs, state.get("history_summary") or "")
 
+    # 第二道门禁：检查提示词注入、0 元改价、跳过确认卡片等恶意指令；命中则短路直接结束图流程
     block_reason = detect_prompt_injection(latest_query)
     if block_reason:
         emit_thought(
@@ -419,6 +444,7 @@ async def input_guard_node(state: MainGraphState) -> Dict[str, Any]:
             "messages": [AIMessage(content=safe_reply)],
         }
 
+    # 安检通过：重置本轮临时产出字段（sub_results / citations / tool_steps 等），防止串用上一轮结果
     emit_thought(
         key="guard",
         phase="guard",
@@ -457,10 +483,12 @@ async def intent_router_node(state: MainGraphState) -> Dict[str, Any]:
         detail="识别是否包含复合多意图，并提取场次、张数、预算与锁座确认倾向",
         status="running",
     )
+    # 先跑确定性正则规则抽取，拿到基准意图与精确槽位（坐标、订单号、预算等）
     rule_intents, merged_slots = extract_deterministic_signals(query, prev_slots)
 
     final_intents = rule_intents
     try:
+        # 调用温度 0.0 的大模型做语义路由，补足口语泛化场景（如没出现死关键词的隐含意图）
         llm = get_chat_llm(temperature=0.0)
         slot_ctx = json.dumps(merged_slots, ensure_ascii=False)
         recent_ctx = (state.get("history_summary") or "").strip() or "无"
@@ -495,6 +523,7 @@ async def intent_router_node(state: MainGraphState) -> Dict[str, Any]:
                 combined.append("purchase")
             final_intents = _normalize_intents(combined)
 
+            # 将 LLM 抽取的槽位与正则槽位做“防幻觉校准合并”（以精确坐标/当前轮明确表达为准）
             llm_slots = parsed.get("slots") or {}
             if isinstance(llm_slots, dict):
                 prev_kw = str(prev_slots.get("show_keyword") or "").strip().lower()

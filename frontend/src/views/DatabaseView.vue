@@ -1,4 +1,9 @@
 <script setup lang="ts">
+/**
+ * 【运维专属 · 微服务多库实时透视面板（DatabaseView）】
+ * 实时只读查看三个隔离微服务库（ticket_user / ticket_show / ticket_order）的业务表及 Seata undo_log、MQ 审计表，
+ * 并支持一键触发“缓存穿透空值哨兵”演练，方便现场直观展示底层数据一致性。
+ */
 import { computed, onMounted, ref, watch } from 'vue'
 import { BarChart3, ChevronLeft, ChevronRight, Database, HardDrive, Layers, RotateCw, Search } from 'lucide-vue-next'
 import { loadAdminDatabases, probePenetration, state } from '../store'

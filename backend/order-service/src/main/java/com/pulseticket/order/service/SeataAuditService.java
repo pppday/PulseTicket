@@ -11,6 +11,13 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 
+/**
+ * 分布式事务与消息审计留痕服务。
+ *
+ * 通俗理解：这是订单系统的“黑匣子记录仪”。
+ * 核心设计亮点是所有写入方法都加了 `Propagation.REQUIRES_NEW`：即便外层下单业务失败或触发了 Seata 全局回滚，
+ * 这两条审计记录也会在独立新事务中成功落库，方便在前端【架构遥测】页清楚看到“提交/回滚”和 MQ 投递轨迹。
+ */
 @Service
 @RequiredArgsConstructor
 public class SeataAuditService {

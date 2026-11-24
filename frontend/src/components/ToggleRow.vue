@@ -1,4 +1,5 @@
 <script setup lang="ts">
+/** 【通用带标题说明的开关行组件（ToggleRow）】：用于结算栏里的管理员演练开关等布尔配置项。 */
 defineProps<{ title: string; description: string; tone?: 'ink' | 'brick' }>()
 const model = defineModel<boolean>({ default: false })
 </script>

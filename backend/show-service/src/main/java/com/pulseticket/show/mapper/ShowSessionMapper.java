@@ -6,6 +6,7 @@ import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
 import org.apache.ibatis.annotations.Update;
 
+/** 演出场次表（show_session）Mapper，内置一条按座位明细实时汇总余票/锁座/已售统计的同步 SQL。 */
 @Mapper
 public interface ShowSessionMapper extends BaseMapper<ShowSession> {
 

@@ -1,3 +1,18 @@
+"""
+【黑盒子图 ①：knowledge_agent —— 规则与场馆问答专员（Agentic RAG）】
+
+通俗理解：这是剧场里的“政策法规专员”，**只读不写**（绝不碰下单/退单工具），专门回答退票规则、实名制、儿童身高、场馆交通、禁带物品等条款问题。
+
+内部 4 步自省闭环：
+  START
+    -> query_rewrite（口语改写：把“去不了能退吗”改写成含业务术语的检索词，去掉后半句选座废话）
+    -> hybrid_retrieve（双路混合检索：jieba BM25 + bge-m3 pgvector 向量 + RRF 融合 + Cross-Encoder 重排）
+    -> grade_evidence（证据裁判：检查召回片段是否真能回答问题；如果证据不足且重试次数 < 1，回跳 query_rewrite 换词重查一次）
+    -> generate_answer（证据充分：严格按片段作答并强制标注 `[POL-xxx]` 条款编号）
+       或 refuse_answer（明确属于发票/宠物/学生票等未收录盲区，或重查后仍无依据：零幻觉老实拒答）
+  -> END
+"""
+
 import re
 from typing import Any, Dict, List, TypedDict
 

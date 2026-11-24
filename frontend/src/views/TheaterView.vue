@@ -1,4 +1,9 @@
 <script setup lang="ts">
+/**
+ * 【选座购票核心大厅（TheaterView）】
+ * C 端核心主视图：上半部分展示在售演出海报卡片（管理员可拖拽调序/新增编辑）；
+ * 选中某场演出后进入 48 座全息选座矩阵（SeatMap）+ 右侧结算栏（CheckoutPanel），管理员还可展开缓存三防与高并发抢座压测实验室（StressLab）。
+ */
 import { computed, ref, watch } from 'vue'
 import { ArrowLeft, ArrowRight, BarChart3, CloudUpload, Database, Pencil, Plus } from 'lucide-vue-next'
 import { api } from '../api'

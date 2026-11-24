@@ -1,12 +1,23 @@
+"""
+全局配置加载中心。
+
+职责说明：
+- 启动时按优先级自动查找并加载 `.env` 环境变量文件（不覆盖操作系统里已注入的环境变量）；
+- 统一收口端口、Java 微服务直连地址、大模型 / Embedding / Rerank 接口参数、PostgreSQL / SQLite 存储路径，
+  以及会话 7 天过期与大模型 3 轮滑动上下文窗口等运维策略，供整个 `app` 包通过单例 `settings` 读取。
+"""
+
 import os
 from pathlib import Path
 from dotenv import load_dotenv
 
 # 依次尝试加载 agent/.env、pulseticket/.env、pulseflow/.env
+# 目录层级：config.py -> app/ -> agent/ (parents[1]) -> pulseticket/ -> 工作区根目录
 AGENT_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = AGENT_ROOT.parent
 WORKSPACE_ROOT = PROJECT_ROOT.parent
 
+# override=False 表示“先到先得”：容器/系统环境变量优先级最高，其次是越贴近 agent 目录的 .env
 for env_candidate in [
     AGENT_ROOT / ".env",
     PROJECT_ROOT / ".env",
@@ -17,6 +28,8 @@ for env_candidate in [
 
 
 class Settings:
+    """集中管理 Agent 服务所有环境变量配置项（带合理默认值，避免未配即崩）。"""
+
     # Agent 服务监听端口
     AGENT_PORT: int = int(os.getenv("AGENT_PORT", "8204"))
 

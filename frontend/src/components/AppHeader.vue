@@ -1,4 +1,9 @@
 <script setup lang="ts">
+/**
+ * 【顶部全局导航栏组件（AppHeader）】
+ * 根据当前登录用户角色动态展示导航标签（普通用户看“演出选座/我的订单”，管理员额外可见“票房销量/数据库总览/架构观测”），
+ * 右侧显示待支付红点、未读站内信提醒以及会员资料/退出登录菜单。
+ */
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { Bell, ChevronDown, LogOut, ShieldCheck, Ticket } from 'lucide-vue-next'
 import {

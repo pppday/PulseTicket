@@ -10,6 +10,10 @@ import lombok.NoArgsConstructor;
 
 import java.time.LocalDateTime;
 
+/**
+ * 会员账号实体（映射 `ticket_user.user_account` 表）。
+ * 存储用户名、BCrypt 密码哈希、实名手机号、VIP 等级、RBAC 角色（USER / ADMIN）、积分余额与累计成单数。
+ */
 @Data
 @Builder
 @NoArgsConstructor

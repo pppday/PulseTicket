@@ -24,6 +24,10 @@ import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+/**
+ * 轻量级阿里云 OSS 直传服务（零重型 SDK 依赖，直接用 JDK HttpClient + HmacSHA1 签名实现）。
+ * 负责后台演出海报图片的上传、公网可访问 URL 拼接以及拉取 OSS 图库历史文件列表。
+ */
 @Service
 public class AliyunOssService {
 

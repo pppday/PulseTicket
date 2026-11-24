@@ -17,6 +17,10 @@ import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+/**
+ * 演出库启动自检与场馆字典初始化器：
+ * 启动时自动检查并补齐 `poster_url` 字段与 `venue_dict` 场馆字典表，同时定期顺延已过期演示场次的开演时间，确保任何时候打开都有在售演出可买。
+ */
 @Component
 @RequiredArgsConstructor
 public class ShowOssSchemaInitializer implements ApplicationRunner {

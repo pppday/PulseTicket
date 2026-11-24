@@ -1,4 +1,8 @@
 <script setup lang="ts">
+/**
+ * 【运维专属 · 架构可观测与事务/MQ/Agent 遥测页（TelemetryView）】
+ * 可视化展示一笔下单经过的 4 道架构防线，并实时拉取 Seata 全局事务审计、RabbitMQ 消息事件以及 Python 智能体 Trace 日志。
+ */
 import { computed, ref } from 'vue'
 import { ChevronDown, RotateCw } from 'lucide-vue-next'
 import { loadProfile, loadTelemetry, state } from '../store'

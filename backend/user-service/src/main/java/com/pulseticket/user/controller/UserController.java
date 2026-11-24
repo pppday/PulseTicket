@@ -24,6 +24,13 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
+/**
+ * 用户认证、个人档案、站内信与后台会员目录 REST 入口（端口 :8201）。
+ *
+ * 通俗理解：
+ * - 登录/注册在网关白名单内，验证密码（BCrypt）通过后签发 JWT Token；
+ * - 个人资料、修改实名手机号、消息已读全部信任网关验签后透传的 `UserContext`，避免业务接口重复解析 JWT。
+ */
 @RestController
 @RequestMapping("/api/user")
 @RequiredArgsConstructor

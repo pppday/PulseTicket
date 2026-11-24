@@ -1,4 +1,5 @@
 <script setup lang="ts">
+/** 【全局右下角轻提示弹窗宿主组件（ToastHost）】：统一消费 store 中的 toast 队列并带入出场动画展示。 */
 import { toasts } from '../store'
 
 const dot = { success: 'bg-sage', error: 'bg-brick', info: 'bg-ink' }

@@ -7,6 +7,10 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
+/**
+ * show-service 的 Redisson 客户端配置：
+ * 主要用于热点演出详情缓存失效时的互斥重建锁（防缓存击穿）。
+ */
 @Configuration
 public class RedissonConfig {
 

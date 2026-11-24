@@ -10,6 +10,10 @@ import lombok.NoArgsConstructor;
 
 import java.time.LocalDateTime;
 
+/**
+ * 站内信通知实体（映射 `ticket_user.user_message` 表）。
+ * 用于存放新人欢迎信、电子票签发通知、阶梯退票办结通知等消息。
+ */
 @Data
 @Builder
 @NoArgsConstructor

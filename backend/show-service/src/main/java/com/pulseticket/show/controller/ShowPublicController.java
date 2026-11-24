@@ -14,6 +14,13 @@ import org.springframework.web.multipart.MultipartFile;
 import java.util.List;
 import java.util.Map;
 
+/**
+ * 演出目录、选座图、核价与管理员后台演艺管理 REST 入口（端口 :8202）。
+ *
+ * 通俗理解：
+ * - `/api/show/public/**`：面向所有观众和 Python Agent 开放的只读查询与核价接口；
+ * - `/api/show/admin/**` 和 `/cache/evict/**`：严格要求 ADMIN 权限，负责上下架、排序、OSS 上传海报与运维统计。
+ */
 @RestController
 @RequestMapping("/api/show")
 @RequiredArgsConstructor

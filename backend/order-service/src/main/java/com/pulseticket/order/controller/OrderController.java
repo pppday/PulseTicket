@@ -90,6 +90,11 @@ public class OrderController {
         return Result.ok(Map.of("lanIp", ip));
     }
 
+    /**
+     * 选座锁座并创建待支付订单：
+     * - 支持 Idempotency-Key 幂等防重（Python Agent 确认卡片点击或前端网络重试都不会重复建单）；
+     * - 只有管理员才能开启“15秒极速超时演示”、“Seata 故障回滚注入”和“虚拟买家并发压测”。
+     */
     @PostMapping("/create")
     public Result<TicketOrder> createOrder(
             @RequestBody CreateOrderRequest req,
@@ -125,6 +130,7 @@ public class OrderController {
         return Result.ok("锁座下单成功，请在倒计时结束前完成支付", order);
     }
 
+    /** 模拟收银台支付订单：CAS 将 UNPAID 改为 PAID，签发电子票码并通过 MQ 广播出票与发积分。 */
     @PostMapping("/{orderNo}/pay")
     public Result<TicketOrder> payOrder(@PathVariable String orderNo) {
         Long userId = requireUserId();
@@ -132,6 +138,7 @@ public class OrderController {
         return Result.ok("支付成功！电子票已签发", paid);
     }
 
+    /** 主动取消未支付订单：CAS 关闭订单并立即通知 show-service 归还锁定座位。 */
     @PostMapping("/{orderNo}/cancel")
     public Result<TicketOrder> cancelOrder(@PathVariable String orderNo) {
         Long userId = requireUserId();
@@ -139,6 +146,7 @@ public class OrderController {
         return Result.ok("订单已取消，锁定座位已释放", cancelled);
     }
 
+    /** 已支付订单自助阶梯退票：按距开演时间算手续费，释放座位并广播 MQ 回退观演积分。 */
     @PostMapping("/{orderNo}/refund")
     public Result<Map<String, Object>> refundOrder(@PathVariable String orderNo) {
         Long userId = requireUserId();
@@ -146,12 +154,14 @@ public class OrderController {
         return Result.ok("退票申请已办结，座位已释放", receipt);
     }
 
+    /** 查询当前登录用户自己的全部历史订单（按创建时间倒序）。 */
     @GetMapping("/my")
     public Result<List<TicketOrder>> listMyOrders() {
         Long userId = requireUserId();
         return Result.ok(orderFacade.listUserOrders(userId));
     }
 
+    /** 按订单号查询单笔订单详情（严格校验订单归属当前登录用户）。 */
     @GetMapping("/detail/{orderNo}")
     public Result<TicketOrder> getOrderDetail(@PathVariable String orderNo) {
         Long userId = requireUserId();

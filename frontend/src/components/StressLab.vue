@@ -1,4 +1,9 @@
 <script setup lang="ts">
+/**
+ * 【运维专属 · 20 并发模拟抢座防超卖压测组件（StressLab）】
+ * 同时用 Promise.all 并发发起 20 个虚拟买家（stressSlot 1~20）争抢同一个空座，
+ * 直观验证后端「RedissonMultiLock + 数据库 CAS 条件锁」三层防线最终只放行 1 人成功、其余 19 人被精准拦截且零超卖。
+ */
 import { ref } from 'vue'
 import { api, readableMessage } from '../api'
 import { refreshAll, state, toast } from '../store'

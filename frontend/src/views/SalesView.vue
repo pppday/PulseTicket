@@ -1,4 +1,8 @@
 <script setup lang="ts">
+/**
+ * 【运维专属 · 平台票房与订单漏斗大盘（SalesView）】
+ * 汇总展示全平台实付票房、各票档（VIP/中轴/看台）营收占比、近 7 日销售趋势及订单转化漏斗。
+ */
 import { computed, onMounted, ref } from 'vue'
 import { ArrowUpRight, Database, RotateCw, Smartphone, Ticket, TrendingUp, Users } from 'lucide-vue-next'
 import { loadAdminSales, state } from '../store'

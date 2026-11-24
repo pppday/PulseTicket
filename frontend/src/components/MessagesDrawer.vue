@@ -1,4 +1,8 @@
 <script setup lang="ts">
+/**
+ * 【右侧滑出站内信通知抽屉（MessagesDrawer）】
+ * 展示系统异步推送的电子票签发通知、阶梯退票办结通知与新人礼遇消息，支持单条/一键已读及 ESC 关闭。
+ */
 import { computed, onMounted, onUnmounted } from 'vue'
 import { X } from 'lucide-vue-next'
 import { markAllMessagesRead, markMessageRead, state } from '../store'

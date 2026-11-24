@@ -9,6 +9,9 @@ import org.springframework.stereotype.Component;
 
 /**
  * 启动时幂等对齐历史演示已售席位对应的已支付订单记录（基于 order_no 唯一索引，绝不覆盖或冲突现有订单）
+ * 作用：
+ * 1. 自动检查并补齐 ticket_order 表的防重下单幂等字段和唯一索引（兼容老库平滑升级）；
+ * 2. 用 INSERT IGNORE 回填演示数据里的几笔历史已售订单，让前端票房统计和“已售座位”数据严格对得上账。
  */
 @Component
 @RequiredArgsConstructor
@@ -18,10 +21,14 @@ public class OrderSeedSyncInitializer {
 
     private final JdbcTemplate jdbcTemplate;
 
+    /**
+     * Spring 容器启动后自动执行一次：先补齐幂等表结构，再安全回填演示订单
+     */
     @PostConstruct
     public void syncHistoricalSeededOrders() {
         ensureIdempotencySchema();
 
+        // 利用 MySQL 的 INSERT IGNORE + order_no 唯一索引，重复启动服务也不会报错或覆盖已有订单
         String sql = """
                 INSERT IGNORE INTO ticket_order (
                     order_no, user_id, username, show_id, show_title, venue_name,
@@ -66,9 +73,11 @@ public class OrderSeedSyncInitializer {
 
     /**
      * 为已有数据库幂等补齐 idempotency_key 字段与 (user_id, idempotency_key) 唯一索引
+     * 大白话：防止用户在旧版数据库上启动时因为缺字段报错，查询 information_schema 确认缺失后才执行 ALTER TABLE。
      */
     private void ensureIdempotencySchema() {
         try {
+            // 先查表结构确认 idempotency_key 列存不存在
             Integer colCount = jdbcTemplate.queryForObject(
                     "SELECT COUNT(*) FROM information_schema.COLUMNS "
                             + "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'ticket_order' AND COLUMN_NAME = 'idempotency_key'",
@@ -82,6 +91,7 @@ public class OrderSeedSyncInitializer {
                 log.info("[OrderSeedSync] Added column idempotency_key to ticket_order");
             }
 
+            // 再查联合唯一索引存不存在，用来兜底拦截同一个用户携带相同幂等键并发重复下单
             Integer idxCount = jdbcTemplate.queryForObject(
                     "SELECT COUNT(*) FROM information_schema.STATISTICS "
                             + "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'ticket_order' AND INDEX_NAME = 'uk_user_idempotency'",

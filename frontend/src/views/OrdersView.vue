@@ -1,4 +1,10 @@
 <script setup lang="ts">
+/**
+ * 【我的订单与自助退改页（OrdersView）】
+ * 展示当前登录用户的全部订单（按待支付/已出票/已关闭筛选），支持：
+ * - 待支付订单实时倒计时、一键付款出票、主动取消释座；
+ * - 已支付订单实时按 [POL-REFUND-001] 计算阶梯退票费，经 RefundConfirmModal 二次确认后执行自助退票。
+ */
 import { computed, ref } from 'vue'
 import RefundConfirmModal from '../components/RefundConfirmModal.vue'
 import { cancelOrder, payOrder, refundOrder, state } from '../store'

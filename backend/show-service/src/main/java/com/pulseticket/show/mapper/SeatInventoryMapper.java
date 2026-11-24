@@ -8,6 +8,10 @@ import org.apache.ibatis.annotations.Update;
 
 import java.util.List;
 
+/**
+ * 座位库存数据访问层（MyBatis-Plus Mapper）。
+ * 包含防超卖核心 CAS 锁座 SQL（WHERE status='AVAILABLE'）、取消/退票幂等释座 SQL 及支付后转 SOLD SQL。
+ */
 @Mapper
 public interface SeatInventoryMapper extends BaseMapper<SeatInventory> {
 

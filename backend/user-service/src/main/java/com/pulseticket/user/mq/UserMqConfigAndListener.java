@@ -16,6 +16,11 @@ import org.springframework.context.annotation.Configuration;
 
 import java.io.IOException;
 
+/**
+ * user-service 的 RabbitMQ 广播消费者配置：
+ * 1. 订阅 `ticket.order.paid.fanout`：订单支付成功后异步加积分、发电子票站内信（与下单主链路解耦）；
+ * 2. 订阅 `ticket.order.refunded.fanout`：已支付订单退票后异步冲正扣回积分、发退票站内信（防白嫖刷分）。
+ */
 @Configuration
 @RequiredArgsConstructor
 public class UserMqConfigAndListener {

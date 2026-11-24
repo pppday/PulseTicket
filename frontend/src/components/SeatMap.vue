@@ -1,4 +1,8 @@
 <script setup lang="ts">
+/**
+ * 【48 座剧院全息选座矩阵组件（SeatMap）】
+ * 按排号和列号渲染舞台弧线与座位网格（自动在中间留出过道），用不同视觉区分可选、已选、他人锁定待付（LOCKED）和已售出（SOLD）状态。
+ */
 import { computed, ref } from 'vue'
 import type { SeatItem, ZoneCode } from '../types'
 import { money, zones } from '../utils'

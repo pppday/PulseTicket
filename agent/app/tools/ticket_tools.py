@@ -1,3 +1,14 @@
+"""
+【PulseTicket 智能体业务工具箱（Tools & 确定性校验函数）】
+
+通俗理解：这是 Python Agent 连接 Java 微服务的“手脚”——智能体不直连业务 MySQL，所有查演出、找连座、核价、查单、算退费、锁座下单、取消与退票，全通过本文件经 HTTP 调用 `show-service` 和 `order-service`。
+
+重要安全分工：
+- 只读工具（`@tool`）：`search_ticket_policy`、`search_shows`、`recommend_seats`、`list_my_orders`、`check_order_refund_detail`；
+- 写操作提案工具（`@tool`）：`propose_create_order`、`propose_cancel_order`、`propose_refund_order`（仅负责向图状态提交草案，绝不直接改库！）；
+- 确定性校验与真写函数（普通 Python 函数，不暴露给 LLM 直接调）：`quote_seats_from_server`（服务端权威核价）、`inspect_order_for_cancel`（售后资格与退票费精算）、`execute_confirmed_write_action`（仅在用户点击确认卡片后，携带幂等键真正调 Java 写接口）。
+"""
+
 import contextvars
 from datetime import datetime
 import json

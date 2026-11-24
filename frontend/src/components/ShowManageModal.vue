@@ -1,4 +1,8 @@
 <script setup lang="ts">
+/**
+ * 【运维专属 · 演出目录与阿里云 OSS 海报管理弹窗（ShowManageModal）】
+ * 支持管理员新增/编辑演出与 48 座场次、上下架、调整展示排序，并直接上传海报到阿里云 OSS 或从历史图库挑选。
+ */
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import {
   ArrowDown,

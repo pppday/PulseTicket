@@ -1,3 +1,15 @@
+"""
+【全链路可观测性与安全审计模块（AgentTracer）】
+
+通俗理解：这是智能体的“行车记录仪”。
+每次用户提问或点击确认，它都会把：
+- 走了哪条意图路由（intents）和哪些子图（subgraphs）
+- 调了什么工具、引用了哪些 `[POL-xxx]` 条款
+- 是否触发了安全护栏拦截（guard_blocked）、人工确认挂起（interrupted）或真实写库（write_executed）
+- 整体耗时（latency_ms）与回复摘要
+全部写入 PostgreSQL 的 `agent_trace_log` 表（本地没配 PG 时自动降级 SQLite），供前端运维大盘和 DataPulse 跨库统计分析使用。
+"""
+
 from datetime import datetime
 import json
 from pathlib import Path

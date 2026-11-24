@@ -1,3 +1,7 @@
+/**
+ * 全局样式表（基于 Tailwind CSS）。
+ * 统一定义全站的排版抗锯齿、米白纸张风底色、卡片/按钮通用样式、等宽数字（倒计时不抖动）以及“已锁座”斜条纹样式。
+ */
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -13,6 +17,7 @@
     font-feature-settings: 'cv11', 'ss01';
   }
 
+  /* 选中文字时的暖色高亮效果 */
   ::selection {
     background: #f7eae5;
     color: #1a1917;
@@ -20,31 +25,38 @@
 }
 
 @layer components {
+  /* 小号大写眉标文字（常用于模块顶部英文/标签说明） */
   .eyebrow {
     @apply text-[11px] font-medium uppercase tracking-[0.16em] text-ink-mute;
   }
 
+  /* 全站统一的圆角白底卡片容器 */
   .card {
     @apply rounded-3xl border border-line bg-white;
   }
 
+  /* 深色主操作按钮（如确认下单、立即支付） */
   .btn-primary {
     @apply inline-flex items-center justify-center gap-2 rounded-full bg-ink px-5 text-sm font-medium text-white transition hover:bg-black disabled:cursor-not-allowed disabled:opacity-35;
   }
 
+  /* 浅色描边次要按钮（如刷新、取消、关闭） */
   .btn-ghost {
     @apply inline-flex items-center justify-center gap-2 rounded-full border border-line bg-white px-5 text-sm font-medium text-ink transition hover:border-ink/35 hover:bg-paper/60 disabled:cursor-not-allowed disabled:opacity-40;
   }
 }
 
+/* 等宽数字：让倒计时、金额数字在每秒跳动时保持对齐不左右晃动 */
 .tabular {
   font-variant-numeric: tabular-nums;
 }
 
+/* 座位图中“已锁定（待支付）”座位的米黄色斜纹填充样式 */
 .seat-locked {
   background: repeating-linear-gradient(135deg, #efe6d5 0 3px, #faf6ee 3px 6px);
 }
 
+/* 全局自定义细滚动条样式 */
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;

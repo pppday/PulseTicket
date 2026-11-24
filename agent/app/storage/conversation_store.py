@@ -1,3 +1,13 @@
+"""
+【前端展示层会话与消息持久化仓库（ConversationStore）】
+
+通俗理解：这是专门管“左侧历史对话列表”和“聊天窗口消息气泡”的记事本，和 LangGraph 底层只保留最近 3 轮的短期上下文解耦。
+核心职责：
+1. 维护 `agent_conversation`（会话标题、摘要、挂起确认卡、滑动过期时间 TTL）与 `agent_message`（气泡内容、思考步骤、工具卡片、交互组件、确认结果）两张表；
+2. 优先使用生产环境 PostgreSQL 16，本地离线单测自动降级为 SQLite，同一套代码通过 `_sql()` 自动转换 `?` 与 `%s` 占位符；
+3. 强制归属权校验 `assert_owner(thread_id, user_id)`，防止 A 用户串看或篡改 B 用户的会话记录。
+"""
+
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 import json
