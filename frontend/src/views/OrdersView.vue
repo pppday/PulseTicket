@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import RefundConfirmModal from '../components/RefundConfirmModal.vue'
 import { cancelOrder, payOrder, refundOrder, state } from '../store'
 import type { OrderStatus, TicketOrder } from '../types'
 import { calcRefundPreview, closeReasonLabel, countdown, money, parseList, remainingSeconds, shortTime } from '../utils'
@@ -36,19 +37,22 @@ function previewRefund(order: TicketOrder) {
   return calcRefundPreview(order.totalAmount, order.startTime, state.now)
 }
 
-async function handleRefund(order: TicketOrder) {
+const refundTarget = ref<TicketOrder | null>(null)
+
+function openRefundModal(order: TicketOrder) {
   const preview = previewRefund(order)
   if (!preview.refundable) return
-  const ok = window.confirm(
-    `确认对订单 ${order.orderNo} 申请退票？\n` +
-      `适用规则：[POL-REFUND-001] ${preview.tierName}\n` +
-      `订单实付：¥${money(order.totalAmount)}\n` +
-      `手续费（${preview.feeRate}）：¥${money(preview.feeAmount)}\n` +
-      `预计实退金额：¥${money(preview.refundAmount)}\n\n` +
-      `退票后电子核验码将失效，对应座位将立即释放回余票池。`
-  )
-  if (!ok) return
-  await act(order.orderNo, () => refundOrder(order))
+  refundTarget.value = order
+}
+
+async function confirmRefund() {
+  const order = refundTarget.value
+  if (!order) return
+  try {
+    await act(order.orderNo, () => refundOrder(order))
+  } finally {
+    refundTarget.value = null
+  }
 }
 </script>
 
@@ -163,14 +167,14 @@ async function handleRefund(order: TicketOrder) {
               <div class="flex gap-2">
                 <button
                   v-if="previewRefund(order).refundable"
-                  class="btn-ghost h-10 flex-1 border-brick/35 px-0 text-brick hover:bg-brick-soft/50"
+                  class="btn-ghost h-10 flex-1 whitespace-nowrap border-brick/35 px-2 text-brick hover:bg-brick-soft/50"
                   :disabled="busy === order.orderNo"
-                  @click="handleRefund(order)"
+                  @click="openRefundModal(order)"
                 >
                   {{ busy === order.orderNo ? '退票中…' : `申请退票 (${previewRefund(order).feeRate})` }}
                 </button>
                 <button
-                  class="btn-ghost h-10 flex-1 px-0"
+                  class="btn-ghost h-10 flex-1 whitespace-nowrap px-2"
                   @click="state.ticket = order"
                 >
                   查看电子票
@@ -184,5 +188,12 @@ async function handleRefund(order: TicketOrder) {
         </div>
       </article>
     </TransitionGroup>
+
+    <RefundConfirmModal
+      :order="refundTarget"
+      :submitting="!!refundTarget && busy === refundTarget.orderNo"
+      @close="refundTarget = null"
+      @confirm="confirmRefund"
+    />
   </div>
 </template>
