@@ -7,6 +7,7 @@ import com.pulseticket.common.exception.BizException;
 import com.pulseticket.feign.client.ShowSeatClient;
 import com.pulseticket.feign.dto.OrderClosedEventDTO;
 import com.pulseticket.feign.dto.OrderPaidEventDTO;
+import com.pulseticket.feign.dto.OrderRefundedEventDTO;
 import com.pulseticket.order.entity.MqEventLog;
 import com.pulseticket.order.entity.SeataTxAudit;
 import com.pulseticket.order.entity.TicketOrder;
@@ -433,14 +434,36 @@ public class OrderFacade {
             } catch (Exception ignored) {
             }
 
+            // 广播退票事件至 user-service：幂等冲正扣回观演积分并下发退票通知
+            int pointsToDeduct = order.getTotalAmount() != null ? order.getTotalAmount().intValue() : 0;
+            OrderRefundedEventDTO refundEvent = new OrderRefundedEventDTO();
+            refundEvent.setMessageId("msg-refund-pts-" + UUID.randomUUID().toString().substring(0, 8));
+            refundEvent.setOrderNo(orderNo);
+            refundEvent.setUserId(userId);
+            refundEvent.setShowTitle(order.getShowTitle());
+            refundEvent.setSessionTitle(order.getSessionTitle());
+            refundEvent.setTotalAmount(order.getTotalAmount());
+            refundEvent.setFeeAmount((BigDecimal) quote.get("feeAmount"));
+            refundEvent.setFeeRate(String.valueOf(quote.get("feeRate")));
+            refundEvent.setRefundAmount((BigDecimal) quote.get("refundAmount"));
+            refundEvent.setTierName(String.valueOf(quote.get("tierName")));
+            refundEvent.setPointsToDeduct(pointsToDeduct);
+
+            rabbitTemplate.convertAndSend(
+                    OrderMqConfigAndListener.EXCHANGE_ORDER_REFUNDED_FANOUT,
+                    "",
+                    refundEvent,
+                    new CorrelationData(refundEvent.getMessageId())
+            );
+
             seataAuditService.recordMqEvent(
                     msgId,
-                    OrderMqConfigAndListener.EXCHANGE_ORDER_CLOSED_DIRECT,
-                    OrderMqConfigAndListener.ROUTING_ORDER_CLOSED_RELEASE,
+                    OrderMqConfigAndListener.EXCHANGE_ORDER_REFUNDED_FANOUT,
+                    "fanout",
                     orderNo,
                     "ORDER_REFUNDED",
                     "用户自助退票（手续费 " + quote.get("feeRate") + "，实退 ¥" + quote.get("refundAmount")
-                            + "）：通知 show-service 释放已售座位 (SOLD->AVAILABLE)",
+                            + "）：通知 show-service 释放已售座位 (SOLD->AVAILABLE) + user-service 冲正扣回 " + pointsToDeduct + " 观演积分",
                     "DELIVERED"
             );
 
@@ -506,6 +529,7 @@ public class OrderFacade {
         receipt.put("orderNo", order.getOrderNo());
         receipt.put("status", order.getStatus());
         receipt.put("closeReason", order.getCloseReason());
+        receipt.put("pointsDeducted", order.getTotalAmount() != null ? order.getTotalAmount().intValue() : 0);
         receipt.putAll(quote);
         return receipt;
     }

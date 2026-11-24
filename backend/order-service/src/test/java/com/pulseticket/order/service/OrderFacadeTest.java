@@ -240,7 +240,9 @@ class OrderFacadeTest {
         assertEquals("0%", receipt.get("feeRate"));
         assertEquals(new BigDecimal("0.00"), receipt.get("feeAmount"));
         assertEquals(new BigDecimal("1360.00"), receipt.get("refundAmount"));
+        assertEquals(1360, receipt.get("pointsDeducted"));
         verify(showSeatClient).releaseSeats(any());
+        verify(rabbitTemplate).convertAndSend(eq("ticket.order.refunded.fanout"), eq(""), any(Object.class), any(org.springframework.amqp.rabbit.connection.CorrelationData.class));
         verify(seataAuditService).recordMqEvent(anyString(), anyString(), anyString(), eq("TK202611220011"), eq("ORDER_REFUNDED"), anyString(), eq("DELIVERED"));
     }
 

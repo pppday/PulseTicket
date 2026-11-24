@@ -54,6 +54,7 @@ public class OrderMqConfigAndListener {
     public static final String ROUTING_ORDER_CLOSE_TIMEOUT = "order.close.timeout";
 
     public static final String EXCHANGE_ORDER_PAID_FANOUT = "ticket.order.paid.fanout";
+    public static final String EXCHANGE_ORDER_REFUNDED_FANOUT = "ticket.order.refunded.fanout";
     public static final String EXCHANGE_ORDER_CLOSED_DIRECT = "ticket.order.closed.direct";
     public static final String ROUTING_ORDER_CLOSED_RELEASE = "order.closed.release";
 
@@ -139,6 +140,11 @@ public class OrderMqConfigAndListener {
     @Bean
     public FanoutExchange orderPaidFanoutExchange() {
         return new FanoutExchange(EXCHANGE_ORDER_PAID_FANOUT, true, false);
+    }
+
+    @Bean
+    public FanoutExchange orderRefundedFanoutExchange() {
+        return new FanoutExchange(EXCHANGE_ORDER_REFUNDED_FANOUT, true, false);
     }
 
     @Bean

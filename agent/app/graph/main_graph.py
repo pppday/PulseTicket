@@ -253,6 +253,15 @@ async def chitchat_node(state: MainGraphState) -> Dict[str, Any]:
     }
 
 
+def _format_show_title(title: Any) -> str:
+    txt = str(title or "").strip()
+    if not txt:
+        return "演出"
+    if "《" in txt and "》" in txt:
+        return txt
+    return f"《{txt}》"
+
+
 def _format_write_receipt(action_name: str, exec_res: Dict[str, Any], exec_args: Dict[str, Any]) -> str:
     """用确定性模板格式化写操作执行回执（零幻觉、零额外慢请求）"""
     if not exec_res.get("success"):
@@ -269,7 +278,7 @@ def _format_write_receipt(action_name: str, exec_res: Dict[str, Any], exec_args:
         return (
             f"✅ **锁座下单成功！**\n\n"
             f"- **订单号**：`{exec_res.get('orderNo')}`\n"
-            f"- **演出场次**：《{exec_args.get('show_title')}》 · {exec_args.get('session_title', '')}\n"
+            f"- **演出场次**：{_format_show_title(exec_args.get('show_title'))} · {exec_args.get('session_title', '')}\n"
             f"- **锁定席位**：{seats}\n"
             f"- **应付总额**：**¥{exec_res.get('totalAmount')}**\n"
             f"- **订单状态**：`{exec_res.get('status', 'UNPAID')}`（请在 **15 分钟** 内于「我的订单」完成支付，超时将由死信队列自动释放座位 `[POL-LOCK-004]`）"
@@ -277,6 +286,13 @@ def _format_write_receipt(action_name: str, exec_res: Dict[str, Any], exec_args:
         )
 
     if action_name == "propose_refund_order":
+        points_deducted = exec_res.get("pointsDeducted")
+        if points_deducted is None:
+            raw_amt = exec_res.get("totalAmount", exec_args.get("total_amount"))
+            try:
+                points_deducted = int(float(raw_amt)) if raw_amt is not None else 0
+            except Exception:
+                points_deducted = 0
         return (
             f"✅ **退票申请已办结，原已售座位已释放**\n\n"
             f"- **订单号**：`{exec_res.get('orderNo')}`\n"
@@ -284,6 +300,7 @@ def _format_write_receipt(action_name: str, exec_res: Dict[str, Any], exec_args:
             f"- **订单实付**：¥{exec_res.get('totalAmount', exec_args.get('total_amount'))}\n"
             f"- **退票手续费**：¥{exec_res.get('feeAmount', exec_args.get('fee_amount'))}（费率 {exec_res.get('feeRate', exec_args.get('fee_rate'))}）\n"
             f"- **实退金额**：**¥{exec_res.get('refundAmount', exec_args.get('refund_amount'))}**（原路退回）\n"
+            f"- **观演积分冲正**：已同步触发冲正扣回该单原发放积分 **-{points_deducted} 积分**（幂等防重）\n"
             f"- **当前状态**：`{exec_res.get('status', 'CLOSED')}`（原因：`{exec_res.get('closeReason') or 'USER_REFUND'}`，对应席位已恢复为可售状态）"
             + mock_banner
         )
@@ -809,22 +826,22 @@ class MultiAgentTicketManager:
         if confirmation_card.get("actionType") == "CREATE_ORDER":
             seats_str = "、".join(args.get("seat_labels") or [])
             card_prompt = (
-                f"已向服务端实时核验余座并锁定报价：**《{args.get('show_title')}》**（{args.get('session_title', '')}）\n"
+                f"已向服务端实时核验余座并锁定报价：**{_format_show_title(args.get('show_title'))}**（{args.get('session_title', '')}）\n"
                 f"- 席位：**{seats_str}**\n"
                 f"- 服务端核定总价：**¥{args.get('total_amount')}**{mock_hint}\n\n"
                 "请在下方确认卡片点击【确认锁座下单】完成锁定："
             )
         elif confirmation_card.get("actionType") == "REFUND_ORDER":
             card_prompt = (
-                f"已核实已出票订单 **{args.get('order_no')}**（《{args.get('show_title')}》），按 `[POL-REFUND-001]` 核算明细如下：\n"
+                f"已核实已出票订单 **{args.get('order_no')}**（{_format_show_title(args.get('show_title'))}），按 `[POL-REFUND-001]` 核算明细如下：\n"
                 f"- 适用档位：{args.get('tier_name')}\n"
                 f"- 原实付金额：¥{args.get('total_amount')} · 手续费：**¥{args.get('fee_amount')}（{args.get('fee_rate')}）**\n"
                 f"- 预计实退金额：**¥{args.get('refund_amount')}**{mock_hint}\n\n"
-                "请在下方确认卡片点击【确认申请退票】，办结后将同步释放原已售座位："
+                "请在下方确认卡片点击【确认申请退票】，办结后将同步释放原已售座位并冲正扣回该单发放的观演积分："
             )
         else:
             card_prompt = (
-                f"已核实待支付订单 **{args.get('order_no')}**（《{args.get('show_title')}》，"
+                f"已核实待支付订单 **{args.get('order_no')}**（{_format_show_title(args.get('show_title'))}，"
                 f"¥{args.get('total_amount')}），请点击下方确认卡片取消订单并释放座位："
             )
 

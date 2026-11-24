@@ -11,4 +11,7 @@ public interface UserAccountMapper extends BaseMapper<UserAccount> {
 
     @Update("UPDATE user_account SET points_balance = points_balance + #{delta}, total_orders = total_orders + 1 WHERE id = #{userId}")
     int addPointsAndOrderCount(@Param("userId") Long userId, @Param("delta") int delta);
+
+    @Update("UPDATE user_account SET points_balance = GREATEST(0, points_balance - #{delta}), total_orders = GREATEST(0, total_orders - 1) WHERE id = #{userId}")
+    int deductPointsAndOrderCount(@Param("userId") Long userId, @Param("delta") int delta);
 }

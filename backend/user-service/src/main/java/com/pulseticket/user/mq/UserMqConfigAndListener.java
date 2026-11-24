@@ -1,6 +1,7 @@
 package com.pulseticket.user.mq;
 
 import com.pulseticket.feign.dto.OrderPaidEventDTO;
+import com.pulseticket.feign.dto.OrderRefundedEventDTO;
 import com.pulseticket.user.service.UserPointsService;
 import com.rabbitmq.client.Channel;
 import lombok.RequiredArgsConstructor;
@@ -24,6 +25,9 @@ public class UserMqConfigAndListener {
     public static final String EXCHANGE_ORDER_PAID_FANOUT = "ticket.order.paid.fanout";
     public static final String QUEUE_USER_PAID_REWARD = "ticket.user.paid.queue";
 
+    public static final String EXCHANGE_ORDER_REFUNDED_FANOUT = "ticket.order.refunded.fanout";
+    public static final String QUEUE_USER_REFUND_DEDUCT = "ticket.user.refund.queue";
+
     private final UserPointsService userPointsService;
 
     @Bean
@@ -46,6 +50,21 @@ public class UserMqConfigAndListener {
         return BindingBuilder.bind(userPaidRewardQueue).to(orderPaidFanoutExchange);
     }
 
+    @Bean
+    public FanoutExchange orderRefundedFanoutExchange() {
+        return new FanoutExchange(EXCHANGE_ORDER_REFUNDED_FANOUT, true, false);
+    }
+
+    @Bean
+    public Queue userRefundDeductQueue() {
+        return QueueBuilder.durable(QUEUE_USER_REFUND_DEDUCT).build();
+    }
+
+    @Bean
+    public Binding bindUserRefundQueue(Queue userRefundDeductQueue, FanoutExchange orderRefundedFanoutExchange) {
+        return BindingBuilder.bind(userRefundDeductQueue).to(orderRefundedFanoutExchange);
+    }
+
     @RabbitListener(queues = QUEUE_USER_PAID_REWARD)
     public void onOrderPaidMessage(OrderPaidEventDTO event, Message message, Channel channel) throws IOException {
         long deliveryTag = message.getMessageProperties().getDeliveryTag();
@@ -56,6 +75,18 @@ public class UserMqConfigAndListener {
         } catch (Exception ex) {
             log.error("处理订单支付积分消息异常 orderNo={}", event != null ? event.getOrderNo() : "null", ex);
             // 拒绝且不无限重回队首死循环
+            channel.basicNack(deliveryTag, false, false);
+        }
+    }
+
+    @RabbitListener(queues = QUEUE_USER_REFUND_DEDUCT)
+    public void onOrderRefundedMessage(OrderRefundedEventDTO event, Message message, Channel channel) throws IOException {
+        long deliveryTag = message.getMessageProperties().getDeliveryTag();
+        try {
+            userPointsService.processOrderRefundDeductIdempotent(event);
+            channel.basicAck(deliveryTag, false);
+        } catch (Exception ex) {
+            log.error("处理订单退票积分冲正消息异常 orderNo={}", event != null ? event.getOrderNo() : "null", ex);
             channel.basicNack(deliveryTag, false, false);
         }
     }

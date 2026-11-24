@@ -1,6 +1,8 @@
 package com.pulseticket.user.service;
 
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.pulseticket.feign.dto.OrderPaidEventDTO;
+import com.pulseticket.feign.dto.OrderRefundedEventDTO;
 import com.pulseticket.user.entity.PointsLog;
 import com.pulseticket.user.entity.UserAccount;
 import com.pulseticket.user.entity.UserMessage;
@@ -82,6 +84,85 @@ public class UserPointsService {
         }
 
         log.info("[MQ异步解耦成功] 订单 {} 发放积分 +{} 并签发电子票通知", event.getOrderNo(), rewardPoints);
+        return true;
+    }
+
+    /**
+     * 消费 RabbitMQ 退票成功消息：幂等冲正扣回原单发放的观演积分 + 下发退票站内信
+     * - 防止“下单领积分 -> 免手续费退票白嫖积分”的刷分漏洞；
+     * - 依靠 points_log 的 UNIQUE KEY uk_order_biz (order_no, biz_type='ORDER_REFUND_DEDUCT') 保证重投绝不重复扣分；
+     * - 使用 GREATEST(0, points_balance - deduct) 兜底，避免余额扣成负数。
+     */
+    @Transactional(rollbackFor = Exception.class)
+    public boolean processOrderRefundDeductIdempotent(OrderRefundedEventDTO event) {
+        if (event == null || event.getOrderNo() == null || event.getUserId() == null) {
+            return false;
+        }
+
+        // 优先以该订单实际曾发放的 ORDER_PAID_REWARD 积分为准，避免金额口径偏差
+        PointsLog paidLog = pointsLogMapper.selectOne(
+                new LambdaQueryWrapper<PointsLog>()
+                        .eq(PointsLog::getOrderNo, event.getOrderNo())
+                        .eq(PointsLog::getBizType, "ORDER_PAID_REWARD")
+                        .last("LIMIT 1")
+        );
+        int deductPoints;
+        if (paidLog != null && paidLog.getPointsDelta() != null && paidLog.getPointsDelta() > 0) {
+            deductPoints = paidLog.getPointsDelta();
+        } else if (event.getPointsToDeduct() != null && event.getPointsToDeduct() > 0) {
+            deductPoints = event.getPointsToDeduct();
+        } else if (event.getTotalAmount() != null) {
+            deductPoints = Math.max(0, event.getTotalAmount().intValue());
+        } else {
+            deductPoints = 0;
+        }
+
+        UserAccount user = userAccountMapper.selectById(event.getUserId());
+        int currentBalance = (user != null && user.getPointsBalance() != null) ? user.getPointsBalance() : 0;
+        int balanceAfter = Math.max(0, currentBalance - deductPoints);
+        String showTitle = event.getShowTitle() != null ? event.getShowTitle() : "演出订单";
+
+        PointsLog deductLog = new PointsLog();
+        deductLog.setUserId(event.getUserId());
+        deductLog.setOrderNo(event.getOrderNo());
+        deductLog.setBizType("ORDER_REFUND_DEDUCT");
+        deductLog.setPointsDelta(-deductPoints);
+        deductLog.setBalanceAfter(balanceAfter);
+        deductLog.setRemark("阶梯退票积分冲正扣回 · " + showTitle);
+        deductLog.setCreatedAt(LocalDateTime.now());
+
+        try {
+            pointsLogMapper.insert(deductLog);
+        } catch (DuplicateKeyException dup) {
+            log.info("[MQ幂等拦截] 订单 {} 的退票积分冲正已执行过，忽略重复 MQ 投递", event.getOrderNo());
+            return false;
+        }
+
+        userAccountMapper.deductPointsAndOrderCount(event.getUserId(), deductPoints);
+
+        UserMessage msg = new UserMessage();
+        msg.setUserId(event.getUserId());
+        msg.setOrderNo(event.getOrderNo());
+        msg.setMsgType("ORDER_REFUNDED");
+        msg.setTitle("【退票办结】" + showTitle);
+        msg.setContent(String.format(
+                "订单 %s 已按「%s」办结退票：实付 ¥%s，手续费 ¥%s（%s），实退 ¥%s（原路退回）；原发放的 %d 观演积分已同步冲正扣回。",
+                event.getOrderNo(),
+                event.getTierName() != null ? event.getTierName() : "阶梯退票规则",
+                event.getTotalAmount() != null ? event.getTotalAmount() : "0.00",
+                event.getFeeAmount() != null ? event.getFeeAmount() : "0.00",
+                event.getFeeRate() != null ? event.getFeeRate() : "0%",
+                event.getRefundAmount() != null ? event.getRefundAmount() : "0.00",
+                deductPoints
+        ));
+        msg.setIsRead(0);
+        msg.setCreatedAt(LocalDateTime.now());
+        try {
+            userMessageMapper.insert(msg);
+        } catch (DuplicateKeyException ignored) {
+        }
+
+        log.info("[MQ退票补偿成功] 订单 {} 冲正扣回观演积分 -{} 并下发退票站内信", event.getOrderNo(), deductPoints);
         return true;
     }
 }

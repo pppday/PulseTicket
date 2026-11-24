@@ -53,6 +53,18 @@ _POLICY_KW = (
     "寄存", "存包", "多久支付", "超时", "自动取消", "发票", "报销", "顺丰", "快递", "纸质票",
     "邮寄", "宠物", "猫", "狗", "会员升级", "学生票", "半价", "优惠",
 )
+# 明确属于“询问规则/政策/场馆须知”的关键词（区别于带具体订单号的直接退票/取消动作）
+_POLICY_ASK_KW = (
+    "规则", "政策", "条款", "须知", "手续费", "扣多少", "怎么算", "收多少", "费率",
+    "能退吗", "可以退吗", "能不能退", "全额退", "改签", "退改", "怎么退", "如何退", "退票流程", "退款流程",
+    "实名", "身份证", "儿童", "小孩", "身高", "检票", "核验",
+    "地铁", "怎么走", "路线", "交通", "停车", "雨伞", "长柄伞", "禁带", "带水", "饮料",
+    "寄存", "存包", "多久支付", "超时", "自动取消", "发票", "报销", "顺丰", "快递", "纸质票",
+    "邮寄", "宠物", "猫", "狗", "会员升级", "学生票", "半价", "优惠",
+)
+_DIRECT_ORDER_ACTION_KW = (
+    "申请退票", "申请退款", "退票退款", "取消订单", "申请取消", "退掉这单", "退订订单",
+)
 _PURCHASE_KW = (
     "推荐", "选座", "连座", "座位", "有什么演出", "有哪些演出", "近期演出", "想看",
     "星际回响", "歌剧魅影", "音乐剧", "星际穿越", "西湖", "爵士", "白雪公主",
@@ -114,7 +126,8 @@ ROUTER_SYSTEM_PROMPT = """你是 PulseTicket 票务主控图的【意图路由�
 - `price_preference`: 用户要低价/便宜/性价比/看台传 `"lowest_price"`，要 VIP/前排/最佳观看体验传 `"highest_price"`，默认 `"best_view"`（未提及可传 null）。
 - `position_preference`: 用户说靠边/过道传 `"side"`，说中间/中轴传 `"center"`，未提及传 null。
 - `seat_ids`: 仅在用户明确给出数据库 seat_ids 列表时填写；绝不可把“第一排2号座位”中的“2号”误填成 `seat_ids=[2]`！
-- `wants_commit` 仅在用户明确要求“现在帮我锁座/下单/买下选定座位/我要第X排Y号座位”时为 true；如果只是“帮我推荐/有便宜一点的吗/看看座位”则为 false！"""
+- `wants_commit` 仅在用户明确要求“现在帮我锁座/下单/买下选定座位/我要第X排Y号座位”时为 true；如果只是“帮我推荐/有便宜一点的吗/看看座位”则为 false！
+- 区分“咨询政策规则 (policy)”与“对具体订单发起退票/取消 (order)”：当用户点名具体订单号要求办理退票/退款/取消（如“申请退票退款订单 TK...”），且未额外询问规则、手续费怎么算或场馆政策时，只输出 `["order"]`，不要多余输出 `"policy"`！"""
 
 
 def detect_prompt_injection(text: str) -> Optional[str]:
@@ -307,7 +320,12 @@ def extract_deterministic_signals(query: str, prev_slots: Optional[SharedSlots] 
 
     # 9. 规则意图识别
     intents: List[str] = []
-    if any(k in q for k in _POLICY_KW):
+    has_explicit_policy_ask = any(k in q for k in _POLICY_ASK_KW)
+    is_direct_order_action = bool(m_order) and (
+        any(k in q for k in _DIRECT_ORDER_ACTION_KW)
+        or any(k in q for k in ("退票", "退款", "取消", "退单", "退订"))
+    )
+    if has_explicit_policy_ask or (any(k in q for k in _POLICY_KW) and not is_direct_order_action):
         intents.append("policy")
     if m_order or any(k in q for k in _ORDER_KW):
         intents.append("order")
@@ -464,6 +482,15 @@ async def intent_router_node(state: MainGraphState) -> Dict[str, Any]:
             for must_have in ("policy", "order"):
                 if must_have in rule_intents and must_have not in combined:
                     combined.append(must_have)
+            # 若用户明确是对某笔具体订单执行退票/取消操作且未询问政策规则，避免重复拉起知识子图背诵整篇条款
+            has_order_no_in_q = bool(re.search(r"\b(TK\d{8,20}[A-Z0-9]*)\b", query, re.IGNORECASE))
+            if (
+                has_order_no_in_q
+                and "order" in combined
+                and "policy" in combined
+                and not any(k in query for k in _POLICY_ASK_KW)
+            ):
+                combined = [i for i in combined if i != "policy"]
             if merged_slots.get("wants_commit") and "purchase" in rule_intents and "purchase" not in combined:
                 combined.append("purchase")
             final_intents = _normalize_intents(combined)

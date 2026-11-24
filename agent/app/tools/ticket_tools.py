@@ -1209,6 +1209,7 @@ async def execute_confirmed_write_action(
                         "totalAmount": receipt.get("totalAmount"),
                         "feeAmount": receipt.get("feeAmount"),
                         "refundAmount": receipt.get("refundAmount"),
+                        "pointsDeducted": receipt.get("pointsDeducted"),
                         "hoursBeforeStart": receipt.get("hoursBeforeStart"),
                         "message": body.get("message", "退票申请已办结，座位已释放"),
                     }
